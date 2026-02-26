@@ -6,33 +6,57 @@ import zipfile
 import shutil
 import requests
 import subprocess
-from rich.console import Console
-from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
-from rich.prompt import Prompt
-from rich.table import Table
-from deep_translator import GoogleTranslator
+import threading
+import customtkinter as ctk
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-console = Console()
+# Настройки GUI
+ctk.set_appearance_mode("Dark")
+ctk.set_default_color_theme("green")
+
+# Константы
 AI_DIR = "AI"
 MODS_DIR = "mods"
 QUESTS_DIR = os.path.join("config", "ftbquests", "quests")
+CACHE_FILE = "cache.json"
 KOBOLD_API = "http://localhost:5001/v1/chat/completions"
 
-FORMAT_PATTERN = re.compile(r'(\$\([^)]+\)|§[0-9a-fk-orlmn]|\&[0-9a-fk-orlmn]|<br>|\n|%[0-9]*\$?[a-zA-Z])')
+FORMAT_PATTERN = re.compile(r'(\$\([^)]+\)|§[0-9a-fk-orlmn]|\&[0-9a-fk-orlmn]|<br>|\n|%[0-9]*\$?[a-zA-Z\.])')
 KEYS_TO_TRANSLATE = {"name", "title", "text", "description", "subtitle"}
 
+IGNORE_TERMS = [
+    "RF", "FE", "EU", "J", "mB", "mB/t", "RF/t", "FE/t", "AE", 
+    "GUI", "UI", "HUD", "JEI", "REI", "EMI", "API", "JSON", "NBT",
+    "FPS", "TPS", "HP", "XP", "MP", "XP/t", "XYZ", "RGB", "ID",
+    "II", "III", "IV", "VI", "VII", "VIII", "IX", "XI", "XII"
+]
+IGNORE_TERMS.sort(key=len, reverse=True)
+_escaped_terms = [re.escape(t) for t in IGNORE_TERMS]
+IGNORE_PATTERN = re.compile(r'(?<![a-zA-Z])(' + '|'.join(_escaped_terms) + r')(?![a-zA-Z])')
+
+# Глобальный кэш
+translation_cache = {}
+
+def load_cache():
+    global translation_cache
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, 'r', encoding='utf-8') as f:
+                translation_cache = json.load(f)
+        except:
+            translation_cache = {}
+
+def save_cache():
+    with open(CACHE_FILE, 'w', encoding='utf-8') as f:
+        json.dump(translation_cache, f, ensure_ascii=False, indent=2)
+
 def get_mod_name(filepath):
-    filename = os.path.basename(filepath)
-    name = filename.replace('.jar', '')
-    name = re.split(r'-\d', name)[0] 
-    return name.replace('_', ' ').title()
+    return os.path.basename(filepath).replace('.jar', '').split('-0')[0].split('-1')[0].replace('_', ' ').title()
 
 def is_translation_key(text):
     t = text.strip()
     if not t or ' ' in t or '\n' in t: return False
-    if re.match(r'^[a-zA-Z0-9_-]+[.:][a-zA-Z0-9_.-]+$', t): return True
-    return False
+    return bool(re.match(r'^[a-zA-Z0-9_-]+[.:][a-zA-Z0-9_.-]+$', t))
 
 def load_lenient_json(raw_bytes):
     text = raw_bytes.decode('utf-8', errors='ignore')
@@ -41,330 +65,6 @@ def load_lenient_json(raw_bytes):
     text = re.sub(r',\s*}', '}', text) 
     text = re.sub(r',\s*]', ']', text)
     return json.loads(text, strict=False)
-
-# ================= АУДИТ СБОРКИ (АНАЛИЗ) =================
-
-def analyze_modpack():
-    console.print("\n[cyan]Запуск сканирования сборки... Это займет немного времени.[/cyan]")
-    
-    total_en_strings = 0
-    total_ru_strings = 0
-    
-    table = Table(title="Статистика локализации сборки")
-    table.add_column("Файл / Название", style="cyan")
-    table.add_column("Тип", style="magenta")
-    table.add_column("Переведено", justify="right")
-    table.add_column("Прогресс", justify="right")
-
-    if os.path.exists(MODS_DIR):
-        jar_files = [os.path.join(MODS_DIR, f) for f in os.listdir(MODS_DIR) if f.endswith('.jar')]
-        with Progress(SpinnerColumn(), TextColumn("[yellow]Анализ модов...")) as progress:
-            task = progress.add_task("analyze_mods", total=len(jar_files))
-            for filepath in jar_files:
-                mod_name = get_mod_name(filepath)
-                interface_en, interface_ru = 0, 0
-                book_en, book_ru = 0, 0
-                
-                try:
-                    with zipfile.ZipFile(filepath, 'r') as zin:
-                        ru_stats = {}
-                        for item in zin.infolist():
-                            filename_lower = item.filename.lower()
-                            if 'ru_ru.json' in filename_lower or '/ru_ru/' in filename_lower:
-                                try:
-                                    ru_data = load_lenient_json(zin.read(item))
-                                    if '/ru_ru/' in filename_lower and ('patchouli' in filename_lower or 'lexicon' in filename_lower or 'guide' in filename_lower):
-                                        ru_stats[item.filename.lower()] = len([s for s in extract_book_strings(ru_data) if s.strip()])
-                                    else:
-                                        ru_stats[item.filename.lower()] = len([k for k, v in ru_data.items() if isinstance(v, str) and v.strip()])
-                                except: pass
-                        
-                        for item in zin.infolist():
-                            filename_lower = item.filename.lower()
-                            is_book = ('/en_us/' in filename_lower and filename_lower.endswith('.json') and ('patchouli' in filename_lower or 'lexicon' in filename_lower or 'guide' in filename_lower))
-                            is_lang = (filename_lower.endswith('en_us.json') and not is_book)
-
-                            if is_lang:
-                                try:
-                                    en_data = load_lenient_json(zin.read(item))
-                                    count = len([k for k, v in en_data.items() if isinstance(v, str) and v.strip()])
-                                    interface_en += count
-                                    ru_target = item.filename.lower().replace('en_us.json', 'ru_ru.json')
-                                    interface_ru += ru_stats.get(ru_target, 0)
-                                except: pass
-                            elif is_book:
-                                try:
-                                    en_data = load_lenient_json(zin.read(item))
-                                    count = len([s for s in extract_book_strings(en_data) if s.strip()])
-                                    book_en += count
-                                    ru_target = item.filename.lower().replace('/en_us/', '/ru_ru/')
-                                    book_ru += ru_stats.get(ru_target, 0)
-                                except: pass
-                except: pass
-                
-                # Добавляем строку для интерфейса
-                if interface_en > 0:
-                    percent = min(100, int((interface_ru / interface_en) * 100))
-                    total_en_strings += interface_en
-                    total_ru_strings += interface_ru
-                    color = "green" if percent >= 90 else "yellow" if percent >= 50 else "red"
-                    table.add_row(mod_name, "Интерфейс", f"[{color}]{interface_ru} / {interface_en}[/{color}]", f"[{color}]{percent}%[/{color}]")
-                
-                # Добавляем отдельную строку для книг
-                if book_en > 0:
-                    percent = min(100, int((book_ru / book_en) * 100))
-                    total_en_strings += book_en
-                    total_ru_strings += book_ru
-                    color = "green" if percent >= 90 else "yellow" if percent >= 50 else "red"
-                    table.add_row(mod_name, "Книга", f"[{color}]{book_ru} / {book_en}[/{color}]", f"[{color}]{percent}%[/{color}]")
-                    
-                progress.update(task, advance=1)
-
-    if os.path.exists(QUESTS_DIR):
-        with Progress(SpinnerColumn(), TextColumn("[yellow]Анализ квестов...")) as progress:
-            snbt_files = []
-            for root, _, files in os.walk(QUESTS_DIR):
-                for f in files:
-                    if f.endswith('.snbt'): snbt_files.append(os.path.join(root, f))
-            
-            task = progress.add_task("analyze_quests", total=len(snbt_files))        
-            for filepath in snbt_files:
-                filename = os.path.basename(filepath)
-                q_en, q_ru = 0, 0
-                try:
-                    with open(filepath, 'r', encoding='utf-8') as file:
-                        content = file.read()
-                    
-                    strings_to_check = []
-                    for m in re.finditer(r'(title|subtitle|text)\s*:\s*"((?:[^"\\]|\\.)*)"', content):
-                        val = m.group(2)
-                        if val.strip() and not is_translation_key(val): strings_to_check.append(val)
-                        
-                    for m in re.finditer(r'description\s*:\s*\[(.*?)\]', content, re.DOTALL):
-                        desc_content = m.group(1)
-                        for str_m in re.finditer(r'"((?:[^"\\]|\\.)*)"', desc_content):
-                            val = str_m.group(1)
-                            if val.strip() and not is_translation_key(val): strings_to_check.append(val)
-                    
-                    strings_to_check = list(set(strings_to_check))
-                    q_en = len(strings_to_check)
-                    
-                    for s in strings_to_check:
-                        if re.search(r'[А-Яа-яЁё]', s): q_ru += 1
-                            
-                    if q_en > 0:
-                        percent = min(100, int((q_ru / q_en) * 100))
-                        total_en_strings += q_en
-                        total_ru_strings += q_ru
-                        color = "green" if percent >= 90 else "yellow" if percent >= 50 else "red"
-                        table.add_row(filename, "Квест", f"[{color}]{q_ru} / {q_en}[/{color}]", f"[{color}]{percent}%[/{color}]")
-                except: pass
-                progress.update(task, advance=1)
-
-    console.print(table)
-    
-    if total_en_strings > 0:
-        global_percent = int((total_ru_strings / total_en_strings) * 100)
-        color = "green" if global_percent >= 90 else "yellow" if global_percent >= 50 else "red"
-        console.print(Panel(f"[bold]Общая готовность перевода сборки:[/bold] [{color}]{global_percent}%[/{color}]\nВсего строк текста: {total_en_strings} | Из них на русском: {total_ru_strings}", title="Итог Аудита", border_style=color))
-    else:
-        console.print("[yellow]В сборке не найдено файлов для перевода или папки mods/quests пусты![/yellow]")
-
-# ================= АВТОМАТИЗАЦИЯ ИИ =================
-
-def setup_ai():
-    if not os.path.exists(AI_DIR):
-        os.makedirs(AI_DIR)
-        console.print(f"[green]Создана папка {AI_DIR}[/green]")
-
-    kobold_path = os.path.join(AI_DIR, "koboldcpp.exe")
-    if not os.path.exists(kobold_path):
-        console.print("[yellow]Ищем актуальную версию KoboldCPP...[/yellow]")
-        try:
-            api_url = "https://api.github.com/repos/LostRuins/koboldcpp/releases/latest"
-            release_data = requests.get(api_url).json()
-            exe_asset = next(a for a in release_data['assets'] if a['name'].endswith('.exe') and 'nocuda' not in a['name'])
-            
-            with requests.get(exe_asset['browser_download_url'], stream=True) as r:
-                r.raise_for_status()
-                with Progress(TextColumn("[cyan]Скачивание KoboldCPP..."), BarColumn(), TextColumn("[progress.percentage]{task.percentage:>3.0f}%")) as progress:
-                    task = progress.add_task("download", total=int(r.headers.get('content-length', 0)))
-                    with open(kobold_path, 'wb') as f:
-                        for chunk in r.iter_content(chunk_size=8192):
-                            f.write(chunk)
-                            progress.update(task, advance=len(chunk))
-        except Exception as e:
-            console.print(f"[red]Ошибка скачивания: {e}[/red]")
-            return None
-
-    models = [f for f in os.listdir(AI_DIR) if f.endswith('.gguf')]
-    if not models:
-        console.print(Panel("[red]В папке AI нет файла модели![/red]\nПоложите .gguf файл в папку AI.", title="Внимание"))
-        return None
-    return models[0]
-
-def start_kobold(model_name):
-    console.print(f"[cyan]Запуск нейросети: {model_name}...[/cyan]")
-    model_path = os.path.join(AI_DIR, model_name)
-    process = subprocess.Popen(
-        [os.path.join(AI_DIR, "koboldcpp.exe"), model_path, "--port", "5001", "--quiet"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
-    with Progress(SpinnerColumn(), TextColumn("[yellow]Разогрев нейросети...")) as progress:
-        progress.add_task("wait", total=None)
-        for _ in range(60):
-            try:
-                if requests.get("http://localhost:5001/api/v1/model", timeout=1).status_code == 200:
-                    console.print("[green]Сервер ИИ готов![/green]")
-                    return process
-            except: time.sleep(1)
-    console.print("[red]Не удалось запустить сервер ИИ![/red]")
-    process.terminate()
-    return None
-
-def log_translation(progress, en_text, ru_text):
-    en_clean = en_text.replace('\n', ' ')
-    ru_clean = ru_text.replace('\n', ' ')
-    progress.console.print(f"[dim]EN:[/dim] {en_clean[:37] + '...' if len(en_clean) > 40 else en_clean:<40} [yellow]>[/yellow] [green]RU:[/green] {ru_clean[:37] + '...' if len(ru_clean) > 40 else ru_clean}")
-
-# ================= ДВИЖКИ ПЕРЕВОДА =================
-
-def translate_ai_batch(data_dict, context_name, progress, task):
-    batch_size = 20
-    keys = list(data_dict.keys())
-    result = {}
-    
-    for i in range(0, len(keys), batch_size):
-        chunk_keys = keys[i:i + batch_size]
-        chunk_masked = {}
-        mappings = {}
-        keys_to_ai = []
-        
-        for k in chunk_keys:
-            text = data_dict[k]
-            if is_translation_key(text):
-                result[k] = text
-                progress.console.print(f"[dim]EN:[/dim] {text[:37]:<40} [yellow]>[/yellow] [blue]ПРОПУСК (СИСТЕМНЫЙ КЛЮЧ)[/blue]")
-                progress.update(task, advance=1)
-                continue
-                
-            keys_to_ai.append(k)
-            mapping = {}
-            def mask_format(m):
-                marker = f" [#{len(mapping)}#] "
-                mapping[marker.strip()] = m.group(0)
-                return marker
-            
-            chunk_masked[k] = re.sub(r'\s+', ' ', FORMAT_PATTERN.sub(mask_format, text)).strip()
-            mappings[k] = mapping
-
-        if not keys_to_ai: continue
-
-        prompt = f"""Ты — локализатор модов Minecraft. Переведи значения JSON на русский язык. Контекст: {context_name}. 
-ПРАВИЛА: 1. Ключи оставь на английском. 2. Термины: Amethyst->Аметист, Bricks->Кирпичи, Slab->Плита, Stairs->Ступени. 3. НЕ смешивай буквы. 4. Сохраняй [#0#]. 5. Верни ТОЛЬКО валидный JSON без ``` разметки. 6. Непереводимое оставляй в оригинале.
-Текст: {json.dumps(chunk_masked, ensure_ascii=False)}"""
-
-        try:
-            res = requests.post(KOBOLD_API, json={"messages": [{"role": "user", "content": prompt}], "temperature": 0.1, "max_tokens": 2048}, timeout=120).json()
-            trans_text = re.sub(r'^```json\s*|^```\s*|```$', '', res['choices'][0]['message']['content'].strip(), flags=re.IGNORECASE).strip()
-            translated_chunk = json.loads(trans_text, strict=False)
-            
-            for k in keys_to_ai:
-                if k in translated_chunk:
-                    trans = translated_chunk[k]
-                    for marker_idx, (marker, orig) in enumerate(mappings[k].items()):
-                        trans = re.sub(rf'\[\s*#\s*{marker_idx}\s*#\s*\]', lambda m, o=orig: o, trans)
-                    result[k] = trans
-                    log_translation(progress, data_dict[k], trans)
-                else:
-                    result[k] = data_dict[k]
-                progress.update(task, advance=1)
-        except Exception:
-            for k in keys_to_ai:
-                result[k] = data_dict[k]
-                progress.update(task, advance=1)
-                
-    return result
-
-def translate_google_batch(data_dict, context_name, progress, task):
-    translator = GoogleTranslator(source='en', target='ru')
-    keys = list(data_dict.keys())
-    result = {}
-    
-    masked_dict = {}
-    mappings = {}
-    keys_to_translate = []
-    
-    for k in keys:
-        text = data_dict[k]
-        if is_translation_key(text):
-            result[k] = text
-            progress.console.print(f"[dim]EN:[/dim] {text[:37]:<40} [yellow]>[/yellow] [blue]ПРОПУСК (СИСТЕМНЫЙ КЛЮЧ)[/blue]")
-            progress.update(task, advance=1)
-            continue
-        
-        mapping = {}
-        def mask_format(m):
-            marker = f" [#{len(mapping)}#] "
-            mapping[marker.strip()] = m.group(0)
-            return marker
-            
-        masked_dict[k] = re.sub(r'\s+', ' ', FORMAT_PATTERN.sub(mask_format, text)).strip()
-        mappings[k] = mapping
-        keys_to_translate.append(k)
-
-    delimiter = "\n@@@\n"
-    current_keys, current_text, chunks = [], "", []
-
-    for k in keys_to_translate:
-        text = masked_dict[k]
-        if len(current_text) + len(text) + len(delimiter) > 4000:
-            chunks.append((current_keys, current_text))
-            current_keys, current_text = [k], text
-        else:
-            current_keys.append(k)
-            current_text = current_text + delimiter + text if current_text else text
-    if current_keys: chunks.append((current_keys, current_text))
-
-    for chunk_keys, text_to_send in chunks:
-        try:
-            res = translator.translate(text_to_send)
-            time.sleep(0.5)
-            parts = [p.strip() for p in res.split('@@@')]
-            
-            if len(parts) == len(chunk_keys):
-                for idx, k in enumerate(chunk_keys):
-                    trans = parts[idx]
-                    for m_idx, (m, orig) in enumerate(mappings[k].items()):
-                        trans = re.sub(rf'\[\s*#\s*{m_idx}\s*#\s*\]', lambda x, o=orig: o, trans)
-                    result[k] = trans
-                    log_translation(progress, data_dict[k], trans)
-                    progress.update(task, advance=1)
-            else:
-                for k in chunk_keys:
-                    res_single = translator.translate(masked_dict[k])
-                    for m_idx, (m, orig) in enumerate(mappings[k].items()):
-                        res_single = re.sub(rf'\[\s*#\s*{m_idx}\s*#\s*\]', lambda x, o=orig: o, res_single)
-                    result[k] = res_single
-                    log_translation(progress, data_dict[k], res_single)
-                    progress.update(task, advance=1)
-        except Exception:
-            for k in chunk_keys:
-                result[k] = data_dict[k]
-                progress.update(task, advance=1)
-                
-    return result
-
-def translate_list_batch(string_list, context_name, progress, task, engine):
-    chunk_dict = {str(idx): val for idx, val in enumerate(string_list)}
-    if engine == "ai":
-        translated_dict = translate_ai_batch(chunk_dict, context_name, progress, task)
-    else:
-        translated_dict = translate_google_batch(chunk_dict, context_name, progress, task)
-        
-    return [translated_dict.get(str(idx), string_list[idx]) for idx in range(len(string_list))]
-
-# ================= ОБРАБОТКА МОДОВ (JAR) =================
 
 def extract_book_strings(data):
     strings = []
@@ -386,266 +86,488 @@ def inject_book_strings(data, t_iter):
     elif isinstance(data, list):
         for item in data: inject_book_strings(item, t_iter)
 
-def process_jar(filepath, progress, overall_task, string_task, modes, engine, force_overwrite):
-    temp_filepath = filepath + ".temp"
-    translated_any = False
-    mod_name = get_mod_name(filepath)
-    
-    try:
-        with zipfile.ZipFile(filepath, 'r') as zin:
-            ru_stats = {}
-            for item in zin.infolist():
-                filename_lower = item.filename.lower()
-                if 'ru_ru.json' in filename_lower or '/ru_ru/' in filename_lower:
-                    try:
-                        ru_data = load_lenient_json(zin.read(item))
-                        if '/ru_ru/' in filename_lower and ('patchouli_books' in filename_lower or 'lexicon' in filename_lower or 'guide' in filename_lower):
-                            ru_stats[item.filename] = len([s for s in extract_book_strings(ru_data) if s.strip()])
-                        else:
-                            ru_stats[item.filename] = len([k for k, v in ru_data.items() if isinstance(v, str) and v.strip()])
-                    except: ru_stats[item.filename] = 0
+class TranslatorApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title("MineAI Translator 2.0 (Ultimate Localizer)")
+        self.geometry("900x700")
+        self.resizable(False, False)
+        
+        self.ai_process = None
+        load_cache()
+        self.build_ui()
 
-            with zipfile.ZipFile(temp_filepath, 'w', compression=zipfile.ZIP_DEFLATED) as zout:
+    def build_ui(self):
+        # Левая панель (Настройки)
+        self.frame_left = ctk.CTkFrame(self, width=300)
+        self.frame_left.pack(side="left", fill="y", padx=10, pady=10)
+        
+        ctk.CTkLabel(self.frame_left, text="ЧТО ПЕРЕВОДИМ?", font=ctk.CTkFont(size=16, weight="bold")).pack(pady=(10, 5))
+        self.var_mods = ctk.BooleanVar(value=True)
+        self.var_books = ctk.BooleanVar(value=True)
+        self.var_quests = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(self.frame_left, text="Интерфейс (Моды)", variable=self.var_mods).pack(anchor="w", padx=20, pady=5)
+        ctk.CTkCheckBox(self.frame_left, text="Справочники (Книги)", variable=self.var_books).pack(anchor="w", padx=20, pady=5)
+        ctk.CTkCheckBox(self.frame_left, text="Квесты (FTB Quests)", variable=self.var_quests).pack(anchor="w", padx=20, pady=5)
+
+        ctk.CTkLabel(self.frame_left, text="ДВИЖОК ПЕРЕВОДА", font=ctk.CTkFont(size=16, weight="bold")).pack(pady=(20, 5))
+        self.var_engine = ctk.StringVar(value="google")
+        ctk.CTkRadioButton(self.frame_left, text="Google (Быстро, ИИ-потоки)", variable=self.var_engine, value="google").pack(anchor="w", padx=20, pady=5)
+        ctk.CTkRadioButton(self.frame_left, text="Локальная Нейросеть (Лор)", variable=self.var_engine, value="ai").pack(anchor="w", padx=20, pady=5)
+
+        ctk.CTkLabel(self.frame_left, text="РЕЖИМ", font=ctk.CTkFont(size=16, weight="bold")).pack(pady=(20, 5))
+        self.var_mode = ctk.StringVar(value="append")
+        ctk.CTkRadioButton(self.frame_left, text="Доперевод (Сохранить старое)", variable=self.var_mode, value="append").pack(anchor="w", padx=20, pady=5)
+        ctk.CTkRadioButton(self.frame_left, text="Пропуск (От 90% готовности)", variable=self.var_mode, value="skip").pack(anchor="w", padx=20, pady=5)
+        ctk.CTkRadioButton(self.frame_left, text="Полная перезапись (С нуля)", variable=self.var_mode, value="force").pack(anchor="w", padx=20, pady=5)
+
+        self.btn_analyze = ctk.CTkButton(self.frame_left, text="Анализ сборки", fg_color="#0066cc", hover_color="#004c99", command=self.start_analysis)
+        self.btn_analyze.pack(pady=(30, 10), fill="x", padx=20)
+        
+        self.btn_start = ctk.CTkButton(self.frame_left, text="НАЧАТЬ ПЕРЕВОД", fg_color="#28a745", hover_color="#218838", height=40, font=ctk.CTkFont(weight="bold"), command=self.start_translation)
+        self.btn_start.pack(pady=10, fill="x", padx=20)
+
+        # Правая панель (Консоль)
+        self.frame_right = ctk.CTkFrame(self)
+        self.frame_right.pack(side="right", fill="both", expand=True, padx=(0, 10), pady=10)
+        
+        self.textbox = ctk.CTkTextbox(self.frame_right, state="disabled", font=ctk.CTkFont(family="Consolas", size=12))
+        self.textbox.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        self.progress_bar = ctk.CTkProgressBar(self.frame_right)
+        self.progress_bar.pack(fill="x", padx=10, pady=(0, 5))
+        self.progress_bar.set(0)
+        
+        self.lbl_status = ctk.CTkLabel(self.frame_right, text="Ожидание действий...")
+        self.lbl_status.pack(pady=(0, 10))
+
+    def log(self, message):
+        self.textbox.configure(state="normal")
+        self.textbox.insert("end", message + "\n")
+        self.textbox.see("end")
+        self.textbox.configure(state="disabled")
+        
+    def set_status(self, text, val=None):
+        self.lbl_status.configure(text=text)
+        if val is not None:
+            self.progress_bar.set(val)
+            
+    def lock_ui(self, lock=True):
+        state = "disabled" if lock else "normal"
+        self.btn_analyze.configure(state=state)
+        self.btn_start.configure(state=state)
+
+    def start_analysis(self):
+        self.lock_ui(True)
+        self.textbox.configure(state="normal")
+        self.textbox.delete("1.0", "end")
+        self.textbox.configure(state="disabled")
+        threading.Thread(target=self.run_analysis, daemon=True).start()
+
+    def start_translation(self):
+        self.lock_ui(True)
+        self.textbox.configure(state="normal")
+        self.textbox.delete("1.0", "end")
+        self.textbox.configure(state="disabled")
+        threading.Thread(target=self.run_translation, daemon=True).start()
+
+    # ================= ЛОГИКА АНАЛИЗА =================
+    def run_analysis(self):
+        self.log("🚀 Запуск сканирования сборки...\n")
+        total_en, total_ru = 0, 0
+        
+        jar_files = [os.path.join(MODS_DIR, f) for f in os.listdir(MODS_DIR) if f.endswith('.jar')] if os.path.exists(MODS_DIR) else []
+        for i, filepath in enumerate(jar_files):
+            mod_name = get_mod_name(filepath)
+            self.set_status(f"Анализ мода: {mod_name}...", i / len(jar_files))
+            try:
+                with zipfile.ZipFile(filepath, 'r') as zin:
+                    ru_files = {item.filename.lower(): item for item in zin.infolist() if 'ru_ru.json' in item.filename.lower() or '/ru_ru/' in item.filename.lower()}
+                    for item in zin.infolist():
+                        if item.filename.lower().endswith('en_us.json') and 'patchouli' not in item.filename.lower():
+                            try:
+                                en_data = load_lenient_json(zin.read(item))
+                                ru_t = item.filename.lower().replace('en_us.json', 'ru_ru.json')
+                                ru_data = load_lenient_json(zin.read(ru_files[ru_t])) if ru_t in ru_files else {}
+                                en_c = len([k for k, v in en_data.items() if isinstance(v, str) and re.search(r'[a-zA-Z]', v)])
+                                ru_c = sum(1 for k, v in en_data.items() if isinstance(v, str) and re.search(r'[a-zA-Z]', v) and (re.search(r'[А-Яа-яЁё]', str(ru_data.get(k,""))) or ru_data.get(k,"") != v))
+                                if en_c > 0:
+                                    total_en += en_c; total_ru += ru_c
+                                    self.log(f"📦 {mod_name} [Интерфейс]: {ru_c}/{en_c} ({int(ru_c/en_c*100)}%)")
+                            except: pass
+            except: pass
+
+        snbt_files = []
+        if os.path.exists(QUESTS_DIR):
+            for root, _, files in os.walk(QUESTS_DIR):
+                snbt_files.extend([os.path.join(root, f) for f in files if f.endswith('.snbt')])
+                
+        for i, filepath in enumerate(snbt_files):
+            self.set_status(f"Анализ квеста: {os.path.basename(filepath)}...", i / len(snbt_files))
+            try:
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                strings = re.findall(r'(?:"|)(?:title|subtitle|text)(?:"|)\s*:\s*"((?:[^"\\]|\\.)*)"', content, re.IGNORECASE)
+                desc_blocks = re.findall(r'(?:"|)description(?:"|)\s*:\s*\[(.*?)\]', content, re.DOTALL | re.IGNORECASE)
+                for b in desc_blocks: strings.extend(re.findall(r'"((?:[^"\\]|\\.)*)"', b))
+                
+                valid_str = list(set([s for s in strings if s.strip() and not is_translation_key(s) and re.search(r'[a-zA-Z]', s)]))
+                en_c = len(valid_str)
+                ru_c = sum(1 for s in valid_str if re.search(r'[А-Яа-яЁё]', s))
+                if en_c > 0:
+                    total_en += en_c; total_ru += ru_c
+                    self.log(f"📜 {os.path.basename(filepath)} [Квесты]: {ru_c}/{en_c} ({int(ru_c/en_c*100)}%)")
+            except: pass
+
+        if total_en > 0:
+            pct = int((total_ru / total_en) * 100)
+            self.log(f"\n✅ АНАЛИЗ ЗАВЕРШЕН!\nОбщая готовность: {pct}%\nСтрок всего: {total_en} | Переведено: {total_ru}")
+        else:
+            self.log("\n❌ Не найдено файлов для перевода!")
+            
+        self.set_status("Готово", 1.0)
+        self.lock_ui(False)
+
+    # ================= ЛОГИКА ПЕРЕВОДА =================
+    def run_translation(self):
+        modes = []
+        if self.var_mods.get(): modes.append("mods")
+        if self.var_books.get(): modes.append("books")
+        if self.var_quests.get(): modes.append("quests")
+        
+        engine = self.var_engine.get()
+        mode_overwrite = self.var_mode.get()
+
+        jar_files = [os.path.join(MODS_DIR, f) for f in os.listdir(MODS_DIR) if f.endswith('.jar')] if os.path.exists(MODS_DIR) else []
+        snbt_files = []
+        if os.path.exists(QUESTS_DIR):
+            for root, _, files in os.walk(QUESTS_DIR):
+                snbt_files.extend([os.path.join(root, f) for f in files if f.endswith('.snbt')])
+
+        total_files = len(jar_files) + len(snbt_files)
+        if total_files == 0:
+            self.log("❌ Файлы не найдены! Положите скрипт в папку с игрой.")
+            self.lock_ui(False)
+            return
+
+        if engine == "ai" and not self.setup_and_start_ai():
+            self.lock_ui(False)
+            return
+
+        self.log("🚀 ЗАПУСК ПЕРЕВОДА...\n")
+        
+        processed = 0
+        for filepath in jar_files:
+            self.process_jar(filepath, modes, engine, mode_overwrite)
+            processed += 1
+            self.set_status(f"Обработано файлов: {processed}/{total_files}", processed / total_files)
+            
+        for filepath in snbt_files:
+            if "quests" in modes:
+                self.process_snbt(filepath, engine, mode_overwrite)
+            processed += 1
+            self.set_status(f"Обработано файлов: {processed}/{total_files}", processed / total_files)
+
+        save_cache()
+        self.log("\n✅ ГЛОБАЛЬНЫЙ ПЕРЕВОД УСПЕШНО ЗАВЕРШЕН!")
+        self.set_status("Все задачи выполнены!", 1.0)
+        if self.ai_process:
+            self.ai_process.terminate()
+        self.lock_ui(False)
+
+    def setup_and_start_ai(self):
+        if not os.path.exists(AI_DIR): os.makedirs(AI_DIR)
+        models = [f for f in os.listdir(AI_DIR) if f.endswith('.gguf')]
+        if not models:
+            self.log("❌ Ошибка: В папке AI нет .gguf модели!")
+            return False
+            
+        self.log(f"🤖 Запуск ИИ: {models[0]}...")
+        self.ai_process = subprocess.Popen([os.path.join(AI_DIR, "koboldcpp.exe"), os.path.join(AI_DIR, models[0]), "--port", "5001", "--quiet"], stdout=subprocess.DEVNULL)
+        for _ in range(60):
+            try:
+                if requests.get(KOBOLD_API.replace("chat/completions", "models"), timeout=1).status_code == 200:
+                    self.log("✅ ИИ успешно запущен!\n")
+                    return True
+            except: time.sleep(1)
+        self.log("❌ Ошибка: Сервер ИИ не отвечает.")
+        return False
+
+    def translate_engine(self, data_dict, engine):
+        """Отправляет словари на перевод, используя кэш и потоки"""
+        keys = list(data_dict.keys())
+        result = {}
+        to_translate = {}
+        
+        # Проверка кэша и маскировка
+        for k in keys:
+            text = data_dict[k]
+            if text in translation_cache:
+                result[k] = translation_cache[text]
+                continue
+                
+            mapping = {}
+            def mask_format(m):
+                marker = f" [#{len(mapping)}#] "
+                mapping[marker.strip()] = m.group(0)
+                return marker
+                
+            masked = FORMAT_PATTERN.sub(mask_format, text)
+            masked = IGNORE_PATTERN.sub(mask_format, masked)
+            masked = re.sub(r'\s+', ' ', masked).strip()
+            
+            if not masked:
+                result[k] = text
+                continue
+                
+            to_translate[k] = {"original": text, "masked": masked, "mapping": mapping}
+
+        if not to_translate: return result
+
+        # Перевод через Google (Многопоточность)
+        if engine == "google":
+            chunks = []
+            curr_keys, curr_text = [], ""
+            for k, val in to_translate.items():
+                if len(curr_text) + len(val["masked"]) > 2000 or len(curr_keys) >= 20:
+                    chunks.append((curr_keys, curr_text))
+                    curr_keys, curr_text = [k], val["masked"]
+                else:
+                    curr_keys.append(k)
+                    curr_text = curr_text + " |~| " + val["masked"] if curr_text else val["masked"]
+            if curr_keys: chunks.append((curr_keys, curr_text))
+
+            def translate_chunk(chunk_keys, text_to_send):
+                for _ in range(3):
+                    try:
+                        res = requests.get("https://translate.googleapis.com/translate_a/single", params={"client": "gtx", "sl": "en", "tl": "ru", "dt": "t", "q": text_to_send}, timeout=10)
+                        if res.status_code == 429: time.sleep(3); continue
+                        parts = re.split(r'\s*\|\s*~\s*\|\s*', "".join([p[0] for p in res.json()[0] if p[0]]))
+                        if len(parts) == len(chunk_keys):
+                            return chunk_keys, parts
+                    except: time.sleep(1)
+                return chunk_keys, None # Если сломалось - вернем None
+
+            with ThreadPoolExecutor(max_workers=3) as executor: # БЕЗОПАСНЫЙ ЛИМИТ ДЛЯ GOOGLE
+                futures = [executor.submit(translate_chunk, ck, txt) for ck, txt in chunks]
+                for future in as_completed(futures):
+                    c_keys, c_parts = future.result()
+                    if c_parts:
+                        for idx, k in enumerate(c_keys):
+                            trans = c_parts[idx].strip()
+                            for m_idx, (m, orig) in enumerate(to_translate[k]["mapping"].items()):
+                                trans = re.sub(rf'\[\s*#\s*{m_idx}\s*#\s*\]', lambda x, o=orig: o, trans)
+                            result[k] = trans
+                            translation_cache[to_translate[k]["original"]] = trans # Сохраняем в кэш
+                            self.log(f" {to_translate[k]['original'][:30]} -> {trans[:30]}")
+                    else:
+                        # Запасной поштучный план
+                        for k in c_keys:
+                            try:
+                                res = requests.get("https://translate.googleapis.com/translate_a/single", params={"client": "gtx", "sl": "en", "tl": "ru", "dt": "t", "q": to_translate[k]["masked"]}, timeout=5).json()
+                                trans = "".join([p[0] for p in res[0] if p[0]])
+                                for m_idx, (m, orig) in enumerate(to_translate[k]["mapping"].items()):
+                                    trans = re.sub(rf'\[\s*#\s*{m_idx}\s*#\s*\]', lambda x, o=orig: o, trans)
+                                result[k] = trans
+                                translation_cache[to_translate[k]["original"]] = trans
+                                self.log(f" {to_translate[k]['original'][:30]} -> {trans[:30]}")
+                            except: result[k] = to_translate[k]["original"]
+                            time.sleep(0.3)
+                            
+        # Перевод через ИИ (Однопоточно, чтобы не взорвать ПК)
+        else:
+            batch_keys = list(to_translate.keys())
+            for i in range(0, len(batch_keys), 20):
+                b_keys = batch_keys[i:i+20]
+                b_dict = {k: to_translate[k]["masked"] for k in b_keys}
+                prompt = f"Ты локализатор. Переведи JSON. ПРАВИЛА: Не переводи ключи. Сохраняй [#0#]. Текст: {json.dumps(b_dict, ensure_ascii=False)}"
+                try:
+                    res = requests.post(KOBOLD_API, json={"messages": [{"role": "user", "content": prompt}], "temperature": 0.1, "max_tokens": 2048}, timeout=120).json()
+                    trans_text = re.sub(r'^```json\s*|^```\s*|```$', '', res['choices'][0]['message']['content'].strip(), flags=re.IGNORECASE).strip()
+                    trans_dict = json.loads(trans_text, strict=False)
+                    for k in b_keys:
+                        if k in trans_dict:
+                            trans = trans_dict[k]
+                            for m_idx, (m, orig) in enumerate(to_translate[k]["mapping"].items()):
+                                trans = re.sub(rf'\[\s*#\s*{m_idx}\s*#\s*\]', lambda x, o=orig: o, trans)
+                            result[k] = trans
+                            translation_cache[to_translate[k]["original"]] = trans
+                            self.log(f" {to_translate[k]['original'][:30]} -> {trans[:30]}")
+                        else: result[k] = to_translate[k]["original"]
+                except:
+                    for k in b_keys: result[k] = to_translate[k]["original"]
+
+        # Сохраняем кэш каждые 100 переводов (на всякий случай)
+        if len(translation_cache) % 50 == 0: save_cache()
+        return result
+
+    def process_jar(self, filepath, modes, engine, mode_overwrite):
+        mod_name = get_mod_name(filepath)
+        temp_filepath = filepath + ".temp"
+        translated_any = False
+        
+        try:
+            with zipfile.ZipFile(filepath, 'r') as zin, zipfile.ZipFile(temp_filepath, 'w', compression=zipfile.ZIP_DEFLATED) as zout:
                 ru_files_written = set()
+                ru_files = {item.filename.lower(): item for item in zin.infolist() if 'ru_ru.json' in item.filename.lower() or '/ru_ru/' in item.filename.lower()}
 
                 for item in zin.infolist():
-                    filename_lower = item.filename.lower()
-                    is_book_lang = ('/en_us/' in filename_lower and filename_lower.endswith('.json') and ('patchouli_books' in filename_lower or 'lexicon' in filename_lower or 'guide' in filename_lower))
-                    is_interface_lang = (filename_lower.endswith('en_us.json') and not is_book_lang)
-                    is_ru = 'ru_ru.json' in filename_lower or '/ru_ru/' in filename_lower
+                    f_lower = item.filename.lower()
+                    is_book = ('/en_us/' in f_lower and f_lower.endswith('.json') and ('patchouli' in f_lower or 'lexicon' in f_lower or 'guide' in f_lower))
+                    is_lang = (f_lower.endswith('en_us.json') and not is_book)
+                    if 'ru_ru.json' not in f_lower and '/ru_ru/' not in f_lower:
+                        zout.writestr(item, zin.read(item))
 
-                    try: content = zin.read(item)
-                    except Exception: continue 
-
-                    if not is_ru: zout.writestr(item, content)
-
-                    if "mods" in modes and is_interface_lang:
+                    if "mods" in modes and is_lang:
                         ru_filename = re.sub(r'en_us\.json$', 'ru_ru.json', item.filename, flags=re.IGNORECASE)
-                        try:
-                            data = load_lenient_json(content)
-                            keys_to_translate = {k: v for k, v in data.items() if isinstance(v, str) and v.strip()}
-                            en_count = len(keys_to_translate)
-                            ru_count = ru_stats.get(ru_filename, 0)
+                        ru_t = ru_filename.lower()
+                        en_data = load_lenient_json(zin.read(item))
+                        ru_data = load_lenient_json(zin.read(ru_files[ru_t])) if ru_t in ru_files else {}
+                        
+                        final_data = en_data.copy()
+                        keys_to_translate = {}
+                        
+                        for k, en_text in en_data.items():
+                            if not isinstance(en_text, str) or not en_text.strip(): continue
+                            if mode_overwrite == "append" and k in ru_data and isinstance(ru_data[k], str) and ru_data[k].strip():
+                                final_data[k] = ru_data[k]
+                                if final_data[k] == en_text and re.search(r'[a-zA-Z]', en_text): keys_to_translate[k] = en_text
+                            elif re.search(r'[a-zA-Z]', en_text): keys_to_translate[k] = en_text
 
-                            if en_count > 0:
-                                if not force_overwrite and ru_count >= en_count * 0.9:
-                                    progress.console.print(f"[bold dim][ПРОПУСК][/bold dim] [cyan]{mod_name}[/cyan] (Интерфейс): Перевод готов")
-                                    if ru_filename in zin.namelist():
-                                        zout.writestr(zin.getinfo(ru_filename), zin.read(ru_filename))
-                                        ru_files_written.add(ru_filename)
-                                else:
-                                    progress.update(string_task, description=f"[cyan]Мод {mod_name}...", total=en_count, completed=0, visible=True)
-                                    if engine == "ai": translated_dict = translate_ai_batch(keys_to_translate, mod_name, progress, string_task)
-                                    else: translated_dict = translate_google_batch(keys_to_translate, mod_name, progress, string_task)
-                                        
-                                    for k, v in translated_dict.items(): data[k] = v
-                                    zout.writestr(ru_filename, json.dumps(data, ensure_ascii=False, indent=2).encode('utf-8'))
-                                    ru_files_written.add(ru_filename)
-                                    translated_any = True
-                        except Exception as e: progress.console.print(f"[bold red]Ошибка мода {mod_name}: {e}[/bold red]")
+                        total_en = len([k for k, v in en_data.items() if isinstance(v, str) and re.search(r'[a-zA-Z]', v)])
+                        if total_en > 0:
+                            if mode_overwrite == "skip" and (total_en - len(keys_to_translate)) >= total_en * 0.9:
+                                self.log(f"⏩ {mod_name} (Интерфейс): Пропуск (уже переведен)")
+                                if ru_t in ru_files:
+                                    zout.writestr(zin.getinfo(ru_files[ru_t].filename), zin.read(ru_files[ru_t]))
+                                    ru_files_written.add(ru_files[ru_t].filename)
+                            elif len(keys_to_translate) == 0 and mode_overwrite == "append":
+                                zout.writestr(ru_filename, json.dumps(final_data, ensure_ascii=False, indent=2).encode('utf-8'))
+                                ru_files_written.add(ru_filename)
+                                translated_any = True
+                            else:
+                                self.log(f"⚡ Перевод {mod_name} (Интерфейс) - {len(keys_to_translate)} строк")
+                                trans_dict = self.translate_engine(keys_to_translate, engine)
+                                for k, v in trans_dict.items(): final_data[k] = v
+                                zout.writestr(ru_filename, json.dumps(final_data, ensure_ascii=False, indent=2).encode('utf-8'))
+                                ru_files_written.add(ru_filename)
+                                translated_any = True
 
-                    elif "books" in modes and is_book_lang:
+                    elif "books" in modes and is_book:
                         ru_filename = re.sub(r'/en_us/', '/ru_ru/', item.filename, flags=re.IGNORECASE)
-                        try:
-                            data = load_lenient_json(content)
-                            strings = [s for s in extract_book_strings(data) if s.strip()]
-                            en_count = len(strings)
-                            ru_count = ru_stats.get(ru_filename, 0)
+                        ru_t = ru_filename.lower()
+                        en_data = load_lenient_json(zin.read(item))
+                        ru_data = load_lenient_json(zin.read(ru_files[ru_t])) if ru_t in ru_files else {}
+                        
+                        en_strings = [s for s in extract_book_strings(en_data) if s.strip()]
+                        ru_strings = [s for s in extract_book_strings(ru_data) if s.strip()] if ru_data else []
+                        
+                        keys_to_translate = {}
+                        final_strings = []
+                        
+                        for i, en_s in enumerate(en_strings):
+                            if mode_overwrite == "append" and i < len(ru_strings) and ru_strings[i].strip():
+                                final_strings.append(ru_strings[i])
+                                if ru_strings[i] == en_s and re.search(r'[a-zA-Z]', en_s): keys_to_translate[str(i)] = en_s
+                            else:
+                                final_strings.append(en_s)
+                                if re.search(r'[a-zA-Z]', en_s): keys_to_translate[str(i)] = en_s
 
-                            if en_count > 0:
-                                if not force_overwrite and ru_count >= en_count * 0.9:
-                                    progress.console.print(f"[bold dim][ПРОПУСК][/bold dim] [magenta]{mod_name}[/magenta] (Книга): Перевод готов")
-                                    if ru_filename in zin.namelist():
-                                        zout.writestr(zin.getinfo(ru_filename), zin.read(ru_filename))
-                                        ru_files_written.add(ru_filename)
-                                else:
-                                    progress.update(string_task, description=f"[magenta]Книга {mod_name}...", total=en_count, completed=0, visible=True)
-                                    translated_strings = translate_list_batch(strings, mod_name, progress, string_task, engine)
-                                    inject_book_strings(data, iter(translated_strings))
-                                    zout.writestr(ru_filename, json.dumps(data, ensure_ascii=False, indent=2).encode('utf-8'))
-                                    ru_files_written.add(ru_filename)
-                                    translated_any = True
-                        except Exception as e: progress.console.print(f"[bold red]Ошибка книги {mod_name}: {e}[/bold red]")
+                        total_en = len([s for s in en_strings if re.search(r'[a-zA-Z]', s)])
+                        if total_en > 0:
+                            if mode_overwrite == "skip" and (total_en - len(keys_to_translate)) >= total_en * 0.9:
+                                self.log(f"⏩ {mod_name} (Книга): Пропуск (уже переведен)")
+                                if ru_t in ru_files:
+                                    zout.writestr(zin.getinfo(ru_files[ru_t].filename), zin.read(ru_files[ru_t]))
+                                    ru_files_written.add(ru_files[ru_t].filename)
+                            elif len(keys_to_translate) == 0 and mode_overwrite == "append":
+                                inject_book_strings(en_data, iter(final_strings))
+                                zout.writestr(ru_filename, json.dumps(en_data, ensure_ascii=False, indent=2).encode('utf-8'))
+                                ru_files_written.add(ru_filename)
+                                translated_any = True
+                            else:
+                                self.log(f"⚡ Перевод {mod_name} (Книга) - {len(keys_to_translate)} строк")
+                                trans_dict = self.translate_engine(keys_to_translate, engine)
+                                for i in range(len(final_strings)):
+                                    if str(i) in trans_dict: final_strings[i] = trans_dict[str(i)]
+                                inject_book_strings(en_data, iter(final_strings))
+                                zout.writestr(ru_filename, json.dumps(en_data, ensure_ascii=False, indent=2).encode('utf-8'))
+                                ru_files_written.add(ru_filename)
+                                translated_any = True
 
                 for item in zin.infolist():
                     if ('ru_ru.json' in item.filename.lower() or '/ru_ru/' in item.filename.lower()) and item.filename not in ru_files_written:
                         try: zout.writestr(item, zin.read(item))
                         except: pass
 
-        if translated_any:
-            shutil.move(temp_filepath, filepath)
-            progress.update(string_task, visible=False)
-        else: os.remove(temp_filepath)
-            
-    except Exception as e:
-        if os.path.exists(temp_filepath): os.remove(temp_filepath)
-        progress.console.print(f"[bold red]Критическая ошибка архива {mod_name}: {e}[/bold red]")
+            if translated_any:
+                shutil.move(temp_filepath, filepath)
+            else: os.remove(temp_filepath)
+        except Exception as e:
+            if os.path.exists(temp_filepath): os.remove(temp_filepath)
+            self.log(f"❌ Ошибка в {mod_name}: {e}")
 
-# ================= ОБРАБОТКА КВЕСТОВ (SNBT) =================
-
-def process_snbt(filepath, progress, overall_task, string_task, engine, force_overwrite):
-    filename = os.path.basename(filepath)
-    bak_path = filepath + ".bak"
-    
-    if not os.path.exists(bak_path):
-        shutil.copy2(filepath, bak_path)
-        content_path = filepath
-    else:
-        content_path = bak_path 
-        
-    try:
-        with open(content_path, 'r', encoding='utf-8') as f:
-            content = f.read()
+    def process_snbt(self, filepath, engine, mode_overwrite):
+        filename = os.path.basename(filepath)
+        bak_path = filepath + ".bak"
+        if not os.path.exists(bak_path): shutil.copy2(filepath, bak_path)
+        content_path = filepath if mode_overwrite == "append" else bak_path
             
-        strings_to_translate = []
-        for m in re.finditer(r'(title|subtitle|text)\s*:\s*"((?:[^"\\]|\\.)*)"', content):
-            val = m.group(2)
-            if val.strip() and not is_translation_key(val): strings_to_translate.append(val)
-            
-        for m in re.finditer(r'description\s*:\s*\[(.*?)\]', content, re.DOTALL):
-            desc_content = m.group(1)
-            for str_m in re.finditer(r'"((?:[^"\\]|\\.)*)"', desc_content):
-                val = str_m.group(1)
-                if val.strip() and not is_translation_key(val): strings_to_translate.append(val)
+        try:
+            with open(content_path, 'r', encoding='utf-8') as f: content = f.read()
                 
-        strings_to_translate = list(set(strings_to_translate))
-        en_count = len(strings_to_translate)
-        
-        if en_count == 0: return
+            strings_to_translate = []
+            for m in re.finditer(r'(?:"|)(title|subtitle|text)(?:"|)\s*:\s*"((?:[^"\\]|\\.)*)"', content, re.IGNORECASE):
+                val = m.group(2)
+                if val.strip() and not is_translation_key(val) and re.search(r'[a-zA-Z]', val): 
+                    if mode_overwrite == "append" and re.search(r'[А-Яа-яЁё]', val): continue
+                    strings_to_translate.append(val)
+                
+            for m in re.finditer(r'(?:"|)description(?:"|)\s*:\s*\[(.*?)\]', content, re.DOTALL | re.IGNORECASE):
+                for str_m in re.finditer(r'"((?:[^"\\]|\\.)*)"', m.group(1)):
+                    val = str_m.group(1)
+                    if val.strip() and not is_translation_key(val) and re.search(r'[a-zA-Z]', val): 
+                        if mode_overwrite == "append" and re.search(r'[А-Яа-яЁё]', val): continue
+                        strings_to_translate.append(val)
+                    
+            strings_to_translate = list(set(strings_to_translate))
             
-        if not force_overwrite and os.path.exists(bak_path):
-            with open(filepath, 'r', encoding='utf-8') as f:
-                if re.search(r'[А-Яа-я]', f.read()):
-                    progress.console.print(f"[bold dim][ПРОПУСК][/bold dim] [yellow]{filename}[/yellow] (Квесты): Перевод готов")
-                    return
+            if len(strings_to_translate) == 0:
+                if mode_overwrite == "append": self.log(f"⏩ {filename} (Квесты): Полностью допереведен")
+                return
+                
+            if mode_overwrite == "skip":
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    if re.search(r'[А-Яа-яЁё]', f.read()):
+                        self.log(f"⏩ {filename} (Квесты): Пропуск (перевод готов)")
+                        return
 
-        progress.update(string_task, description=f"[yellow]Квесты {filename}...", total=en_count, completed=0, visible=True)
-        
-        chunk_dict = {str(i): val for i, val in enumerate(strings_to_translate)}
-        if engine == "ai":
-            translated_dict = translate_ai_batch(chunk_dict, "FTB Quests", progress, string_task)
-        else:
-            translated_dict = translate_google_batch(chunk_dict, "FTB Quests", progress, string_task)
+            self.log(f"⚡ Перевод квестов {filename} - {len(strings_to_translate)} строк")
             
-        trans_map = {strings_to_translate[i]: translated_dict.get(str(i), strings_to_translate[i]) for i in range(en_count)}
-        
-        def repl_single(m):
-            key, val = m.group(1), m.group(2)
-            new_val = trans_map.get(val, val).replace('\\"', '"').replace('"', '\\"')
-            return f'{key}: "{new_val}"'
+            chunk_dict = {str(i): val for i, val in enumerate(strings_to_translate)}
+            trans_dict = self.translate_engine(chunk_dict, engine)
+            trans_map = {strings_to_translate[i]: trans_dict.get(str(i), strings_to_translate[i]) for i in range(len(strings_to_translate))}
             
-        content = re.sub(r'(title|subtitle|text)\s*:\s*"((?:[^"\\]|\\.)*)"', repl_single, content)
-        
-        def repl_desc(m):
-            desc_content = m.group(1)
-            def repl_inner(str_m):
-                val = str_m.group(1)
+            def repl_single(m):
+                key, val = m.group(1), m.group(2)
                 new_val = trans_map.get(val, val).replace('\\"', '"').replace('"', '\\"')
-                return f'"{new_val}"'
-            new_desc_content = re.sub(r'"((?:[^"\\]|\\.)*)"', repl_inner, desc_content)
-            return f'description: [{new_desc_content}]'
-            
-        content = re.sub(r'description\s*:\s*\[(.*?)\]', repl_desc, content, flags=re.DOTALL)
-        
-        with open(filepath, 'w', encoding='utf-8') as f:
-            f.write(content)
-            
-        progress.update(string_task, visible=False)
-        
-    except Exception as e:
-        progress.console.print(f"[bold red]Ошибка квеста {filename}: {e}[/bold red]")
-
-# ================= ГЛАВНОЕ МЕНЮ =================
-
-def main():
-    console.print(Panel.fit("[bold bright_green]ULTIMATE Minecraft Translator[/bold bright_green]\nКомплексный инструмент локализации", border_style="green"))
-    
-    console.print("\n[bold]ЧТО делаем?[/bold]")
-    console.print("1. Интерфейс и предметы (В папке mods)")
-    console.print("2. Внутриигровые справочники/книги (В папке mods)")
-    console.print("3. Квесты FTB Quests (В папке config/ftbquests/quests)")
-    console.print("4. ВСЁ ВМЕСТЕ (Полный перевод)")
-    console.print("5. [bold cyan]Анализ сборки (Узнать % перевода)[/bold cyan]")
-    target_choice = Prompt.ask("Введите номер", choices=["1", "2", "3", "4", "5"], default="5")
-    
-    if target_choice == "5":
-        analyze_modpack()
-        return
-
-    modes = []
-    if target_choice == "1": modes = ["mods"]
-    elif target_choice == "2": modes = ["books"]
-    elif target_choice == "3": modes = ["quests"]
-    elif target_choice == "4": modes = ["mods", "books", "quests"]
-
-    jar_files = []
-    snbt_files = []
-
-    if "mods" in modes or "books" in modes:
-        if os.path.exists(MODS_DIR):
-            jar_files = [os.path.join(MODS_DIR, f) for f in os.listdir(MODS_DIR) if f.endswith('.jar')]
-        else:
-            console.print("[yellow]Внимание: Папка 'mods' не найдена в текущей директории![/yellow]")
-
-    if "quests" in modes:
-        if os.path.exists(QUESTS_DIR):
-            for root, _, files in os.walk(QUESTS_DIR):
-                for f in files:
-                    if f.endswith('.snbt'):
-                        snbt_files.append(os.path.join(root, f))
-        else:
-            console.print("[yellow]Внимание: Папка 'config/ftbquests/quests' не найдена![/yellow]")
-
-    total_files = len(jar_files) + len(snbt_files)
-    if total_files == 0:
-        console.print("[red]Нет файлов для перевода. Проверьте, что скрипт лежит в папке с игрой![/red]")
-        return
-
-    console.print("\n[bold]КАКИМ ДВИЖКОМ переводим?[/bold]")
-    console.print("1. Google Переводчик (Быстро, но машинный текст)")
-    console.print("2. Локальная Нейросеть (Высокое качество, литературный лор)")
-    engine_choice = Prompt.ask("Введите номер", choices=["1", "2"], default="2")
-    engine = "google" if engine_choice == "1" else "ai"
-
-    console.print("\n[bold]РЕЖИМ ПЕРЕЗАПИСИ:[/bold]")
-    console.print("1. Умный пропуск (Пропускать готовые переводы >=90%)")
-    console.print("2. ПРИНУДИТЕЛЬНАЯ ПЕРЕЗАПИСЬ (Стереть старое и перевести заново)")
-    force_choice = Prompt.ask("Введите номер", choices=["1", "2"], default="1")
-    force_overwrite = (force_choice == "2")
-
-    ai_process = None
-    if engine == "ai":
-        model_name = setup_ai()
-        if not model_name: return
-        ai_process = start_kobold(model_name)
-        if not ai_process: return
-
-    try:
-        with Progress(
-            TextColumn("[bold blue]{task.description}"),
-            BarColumn(),
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            TextColumn("[yellow]({task.completed}/{task.total})"),
-            TimeElapsedColumn(),
-            TimeRemainingColumn(),
-            console=console
-        ) as progress:
-            overall_task = progress.add_task("[bold green]Обработка файлов...", total=total_files)
-            string_task = progress.add_task("[cyan]Подготовка...", total=100, visible=False)
-            
-            for filename in jar_files:
-                process_jar(filename, progress, overall_task, string_task, modes, engine, force_overwrite)
-                progress.update(overall_task, advance=1)
+                return f'{key}: "{new_val}"'
                 
-            for filename in snbt_files:
-                process_snbt(filename, progress, overall_task, string_task, engine, force_overwrite)
-                progress.update(overall_task, advance=1)
+            content = re.sub(r'(?:"|)(title|subtitle|text)(?:"|)\s*:\s*"((?:[^"\\]|\\.)*)"', repl_single, content, flags=re.IGNORECASE)
+            
+            def repl_desc(m):
+                def repl_inner(str_m):
+                    val = str_m.group(1)
+                    new_val = trans_map.get(val, val).replace('\\"', '"').replace('"', '\\"')
+                    return f'"{new_val}"'
+                new_desc_content = re.sub(r'"((?:[^"\\]|\\.)*)"', repl_inner, m.group(1))
+                return f'description: [{new_desc_content}]'
                 
-        console.print(Panel("[bold green]Глобальный перевод успешно завершен![/bold green]"))
-    finally:
-        if ai_process:
-            console.print("[dim]Остановка сервера ИИ...[/dim]")
-            ai_process.terminate()
+            content = re.sub(r'(?:"|)description(?:"|)\s*:\s*\[(.*?)\]', repl_desc, content, flags=re.DOTALL | re.IGNORECASE)
+            
+            with open(filepath, 'w', encoding='utf-8') as f: f.write(content)
+        except Exception as e: self.log(f"❌ Ошибка квеста {filename}: {e}")
 
 if __name__ == '__main__':
-    main()
+    app = TranslatorApp()
+    app.mainloop()
