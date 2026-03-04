@@ -146,7 +146,7 @@ MineAI Translator — это мощный, умный и безопасный и
 
 Вам не обязательно устанавливать Python и возиться с кодом! Вы можете скачать уже готовую, собранную программу.
 
-1. Перейдите в раздел [Releases]((https://github.com/Thedrezik/MineAI-Modpack-Translator/releases)) справа.
+1. Перейдите в раздел [Releases](https://github.com/Thedrezik/MineAI-Modpack-Translator/releases) справа.
 2. Скачайте последний файл MineAI_Translator.exe.
 3. Поместите его в удобную папку и запустите двойным кликом.
 
@@ -252,6 +252,7 @@ pyinstaller --noconsole --onefile --icon=icon.ico translator.py
 ```
 
 (Готовый файл появится в папке dist).
+
 
 
 
