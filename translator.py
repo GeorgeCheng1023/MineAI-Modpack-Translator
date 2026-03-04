@@ -7,11 +7,13 @@ import shutil
 import requests
 import subprocess
 import threading
+import traceback
 import configparser
 import tkinter as tk
 from tkinter import filedialog
 import customtkinter as ctk
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
 
 # ================= НАСТРОЙКИ (settings.ini) =================
 config = configparser.ConfigParser()
@@ -37,10 +39,27 @@ ctk.set_appearance_mode(APP_THEME)
 ctk.set_default_color_theme(APP_COLOR)
 
 # Константы
-CACHE_FILE = "cache.json"
+CACHE_FILE_STD = "cache.json"      
+CACHE_FILE_AI = "ai_cache.json"    
 KOBOLD_API = "http://localhost:5001/v1/chat/completions"
+DICT_FILE = "dictionary.json"
 
-FORMAT_PATTERN = re.compile(r'(\$\([^)]+\)|§[0-9a-fk-orlmn]|\&[0-9a-fk-orlmn]|<br>|\n|%[0-9]*\$?[a-zA-Z\.])')
+# ================= УСИЛЕННЫЙ ТИТАНОВЫЙ ЩИТ ИЗ ТЕСТЕРА =================
+FORMAT_PATTERN = re.compile(
+    r'('
+    r'\$\([^)]+\)|'                 # Макросы $(...)
+    r'[&§][0-9a-fk-orlmn]|'         # Цвета
+    r'<[^>]+>|'                     # Теги <item...>
+    r'\{[^\}]+\}|'                  # JSON
+    r'\]\([^)]+\)|'                 # Полные ссылки ](url)
+    r'\[[a-z0-9_.-]+:[a-z0-9_./-]+\]|' # [ae2:item]
+    r'\([a-z0-9_.-]+:[a-z0-9_./-]+\)|' # (ae2:item)
+    r'\([A-Za-z0-9_./-]+\.md[#a-zA-Z0-9_-]*\)|' # Ссылки (.md)
+    r'\n|'                          # Переносы
+    r'%[0-9.,]*\$?[a-zA-Z%]'        # Переменные форматирования Minecraft
+    r')', flags=re.IGNORECASE
+)
+
 KEYS_TO_TRANSLATE = {"name", "title", "text", "description", "subtitle"}
 
 IGNORE_TERMS = [
@@ -52,6 +71,98 @@ IGNORE_TERMS = [
 IGNORE_TERMS.sort(key=len, reverse=True)
 _escaped_terms = [re.escape(t) for t in IGNORE_TERMS]
 IGNORE_PATTERN = re.compile(r'(?<![a-zA-Z])(' + '|'.join(_escaped_terms) + r')(?![a-zA-Z])')
+
+# ================= ВНЕШНИЙ СЛОВАРЬ АВТОЗАМЕН =================
+DEFAULT_DICT = {
+    "полуслой": "плита",
+    "полуслои": "плиты",
+    "полукирпич": "плита",
+    "полукирпичи": "плиты",
+    "сыромятная медь": "сырая медь",
+    "сыромятного меди": "сырой меди",
+    "сыромятное железо": "сырое железо",
+    "сыромятного железа": "сырого железа",
+    "сыромятное золото": "сырое золото",
+    "сыромятного золота": "сырого золота",
+    "необтanium": "необтаниум",
+    "доместик": "прирученный",
+    "wereld": "мир"
+}
+
+def load_dictionary():
+    if not os.path.exists(DICT_FILE):
+        with open(DICT_FILE, 'w', encoding='utf-8') as f:
+            json.dump(DEFAULT_DICT, f, ensure_ascii=False, indent=4)
+        return DEFAULT_DICT
+    try:
+        with open(DICT_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except:
+        return DEFAULT_DICT
+
+TERMINOLOGY_FIXES = load_dictionary()
+
+def fix_formatting(text):
+    if not text: return text
+    text = re.sub(r'([&§][0-9a-fk-or])\s+', r'\1', text, flags=re.IGNORECASE)
+    text = re.sub(r'\s+([&§][r])', r'\1', text, flags=re.IGNORECASE)
+    text = re.sub(r'\[\s+(%\d*\$?[sd])\s+\]', r'[\1]', text)
+    text = re.sub(r'\(\s+(%\d*\$?[sd])\s+\)', r'(\1)', text)
+    text = re.sub(r'\"\s+(%\d*\$?[sd])\s+\"', r'"\1"', text)
+    text = re.sub(r'\s+,', ',', text)
+    text = re.sub(r'\s+:', ':', text)
+    
+    # ФИКС КРАШЕЙ КНОПОК И ТУЛТИПОВ МАЙНКРАФТА
+    text = re.sub(r'%\s+([sd])', r'%\1', text)                       # "% s" -> "%s"
+    text = re.sub(r'%\s+(\d+)\s*\$\s*([sd])', r'%\1$\2', text)       # "% 1 $ s" -> "%1$s"
+    text = re.sub(r'%\s*\.\s*(\d+)\s*([fd])', r'%.\1\2', text)       # "% . 2 f" -> "%.2f"
+    
+    # ФИКС РАЗРЫВА ССЫЛОК MARKDOWN
+    text = re.sub(r'\]\s+\(', '](', text)                            # "] (" -> "]("
+    text = re.sub(r'!\s+\[', '![', text)                             # "! [" -> "!["
+    text = re.sub(r'\[\s+', '[', text)                               # "[ " -> "["
+    text = re.sub(r'\s+\]', ']', text)                               # " ]" -> "]"
+    
+    text = re.sub(r' {2,}', ' ', text)
+    return text
+
+def fix_terminology(text):
+    if not text: return text
+    for wrong, right in TERMINOLOGY_FIXES.items():
+        def repl(match):
+            word = match.group(0)
+            if word.istitle(): return right.capitalize()
+            elif word.isupper(): return right.upper()
+            return right
+        text = re.sub(r'\b' + wrong + r'\b', repl, text, flags=re.IGNORECASE)
+    return text
+
+def polish_translation(text):
+    if not isinstance(text, str): return text
+    return fix_terminology(fix_formatting(text))
+
+# ================= ДВОЙНОЙ КЭШ =================
+def load_and_polish_cache(filepath):
+    cache_data = {}
+    changes = 0
+    if os.path.exists(filepath):
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                cache_data = json.load(f)
+            for k, v in list(cache_data.items()):
+                new_v = polish_translation(v)
+                if new_v != v:
+                    cache_data[k] = new_v
+                    changes += 1
+            if changes > 0:
+                save_cache_data(cache_data, filepath)
+        except Exception:
+            cache_data = {}
+    return cache_data, changes
+
+def save_cache_data(cache_data, filepath):
+    with open(filepath, 'w', encoding='utf-8') as f:
+        json.dump(cache_data, f, ensure_ascii=False, indent=2)
 
 LANGUAGES = {
     "Русский": {"file": "ru_ru", "api": "ru", "deepl": "RU", "name": "Russian", "regex": r'[А-Яа-яЁё]'},
@@ -67,20 +178,6 @@ LANGUAGES = {
     "한국어": {"file": "ko_kr", "api": "ko", "deepl": "KO", "name": "Korean", "regex": r'[\u3131-\uD79D]'}
 }
 
-translation_cache = {}
-
-def load_cache():
-    global translation_cache
-    if os.path.exists(CACHE_FILE):
-        try:
-            with open(CACHE_FILE, 'r', encoding='utf-8') as f:
-                translation_cache = json.load(f)
-        except: translation_cache = {}
-
-def save_cache():
-    with open(CACHE_FILE, 'w', encoding='utf-8') as f:
-        json.dump(translation_cache, f, ensure_ascii=False, indent=2)
-
 def get_mod_name(filepath):
     return os.path.basename(filepath).replace('.jar', '').split('-0')[0].split('-1')[0].replace('_', ' ').title()
 
@@ -90,9 +187,7 @@ def is_translation_key(text):
     return bool(re.match(r'^[a-zA-Z0-9_-]+[.:][a-zA-Z0-9_.-]+$', t))
 
 def load_lenient_json(raw_bytes):
-    # Исправление кодировки UTF-8 BOM
     text = raw_bytes.decode('utf-8-sig', errors='ignore')
-    # Безопасное удаление комментариев (чтобы не сломать http://)
     text = re.sub(r'/\*.*?\*/', '', text, flags=re.DOTALL) 
     text = re.sub(r'(?m)^\s*//.*$', '', text) 
     text = re.sub(r',\s*([\]}])', r'\1', text) 
@@ -118,24 +213,27 @@ def inject_book_strings(data, t_iter):
     elif isinstance(data, list):
         for item in data: inject_book_strings(item, t_iter)
 
+@lru_cache(maxsize=10000)
 def is_technical_term(text):
-    if not text or len(text) < 5: return True
+    if not text: return True
     lower = text.lower()
+    if not re.search(r'[a-z]', lower): return True 
     if re.match(r'^[a-z0-9_.-]+$', lower) and any(c in lower for c in '._'):
         return True
+    
     if any(prefix in lower for prefix in [
         'glyph_', 'ritual_', 'familiar_', 'source_', 'mana_', 'spell_', 'effect_',
-        'rune_', 'altar_', 'pedestal_', 'summon_', 'ritual', 'glyph'
+        'rune_', 'altar_', 'pedestal_', 'summon_', 'botania_', 'create_', 
+        'mechanism_', 'gear_', 'forest_', 'incantation_', 'sigil_', 'kubejs_'
     ]):
         return True
     return False
 
-
 class TranslatorApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("MineAI Translator 4.4 (Ultimate Edition)")
-        self.geometry("1150x800")
+        self.title("MineAI Translator (AE2 Integrated Edition)")
+        self.geometry("1150x850")
         self.resizable(False, False)
         
         if os.path.exists("icon.ico"):
@@ -146,16 +244,25 @@ class TranslatorApp(ctk.CTk):
         self.mc_dir = os.getcwd()
         self.ai_model_path = ""
         self.is_running = False
+        self.is_paused = False
         
         self.start_time = None
         self.total_strings = 0
         self.translated_strings = 0
         self.last_eta_update = 0
-        
         self.auto_scroll = True
         
-        load_cache()
+        self.cache_std, changes_std = load_and_polish_cache(CACHE_FILE_STD)
+        self.cache_ai, changes_ai = load_and_polish_cache(CACHE_FILE_AI)
+        
+        self.active_cache = self.cache_std
+        self.active_cache_file = CACHE_FILE_STD
+
         self.build_ui()
+        
+        total_changes = changes_std + changes_ai
+        if total_changes > 0:
+            self.log_colored(f"✨ Базы кэша отполированы при запуске: исправлено {total_changes} строк.", "magenta")
 
     def build_ui(self):
         self.frame_left = ctk.CTkScrollableFrame(self, width=370)
@@ -172,22 +279,27 @@ class TranslatorApp(ctk.CTk):
 
         ctk.CTkLabel(self.frame_left, text="МЕТОД СОХРАНЕНИЯ", font=ctk.CTkFont(size=14, weight="bold")).pack(pady=(15, 5))
         self.var_output = ctk.StringVar(value="resourcepack")
-        ctk.CTkRadioButton(self.frame_left, text="📦 Создать Resource Pack\n(Безопасно, не трогает моды)", variable=self.var_output, value="resourcepack").pack(anchor="w", padx=20, pady=5)
-        ctk.CTkRadioButton(self.frame_left, text="⚠️ Перезаписать файлы\n(Изменить .jar моды напрямую)", variable=self.var_output, value="inplace").pack(anchor="w", padx=20, pady=5)
+        ctk.CTkRadioButton(self.frame_left, text="📦 Создать Resource Pack\n(Безопасно, не трогает моды)", variable=self.var_output, value="resourcepack", command=self.update_output_ui).pack(anchor="w", padx=20, pady=5)
+        
+        self.entry_rp_name = ctk.CTkEntry(self.frame_left, placeholder_text="Название файла .zip...")
+        self.entry_rp_name.insert(0, "MineAI_Pack")
+        self.entry_rp_name.pack(fill="x", padx=40, pady=(0, 5))
+
+        ctk.CTkRadioButton(self.frame_left, text="⚠️ Перезаписать файлы\n(Изменить .jar моды напрямую)", variable=self.var_output, value="inplace", command=self.update_output_ui).pack(anchor="w", padx=20, pady=5)
 
         ctk.CTkLabel(self.frame_left, text="ЧТО ПЕРЕВОДИМ?", font=ctk.CTkFont(size=14, weight="bold")).pack(pady=(15, 5))
         self.var_mods = ctk.BooleanVar(value=True)
         self.var_books = ctk.BooleanVar(value=True)
         self.var_quests = ctk.BooleanVar(value=True)
         ctk.CTkCheckBox(self.frame_left, text="Интерфейс (Моды)", variable=self.var_mods).pack(anchor="w", padx=20, pady=2)
-        ctk.CTkCheckBox(self.frame_left, text="Справочники (Книги)", variable=self.var_books).pack(anchor="w", padx=20, pady=2)
+        ctk.CTkCheckBox(self.frame_left, text="Справочники (Книги JSON и MD)", variable=self.var_books).pack(anchor="w", padx=20, pady=2)
         ctk.CTkCheckBox(self.frame_left, text="Квесты (FTB Quests)", variable=self.var_quests).pack(anchor="w", padx=20, pady=2)
 
         ctk.CTkLabel(self.frame_left, text="ДВИЖОК ПЕРЕВОДА", font=ctk.CTkFont(size=14, weight="bold")).pack(pady=(15, 5))
         self.var_engine = ctk.StringVar(value="google")
         ctk.CTkRadioButton(self.frame_left, text="Google (Быстро, ИИ-потоки)", variable=self.var_engine, value="google", command=self.update_engine_ui).pack(anchor="w", padx=20, pady=5)
         ctk.CTkRadioButton(self.frame_left, text="DeepL (API Ключ)", variable=self.var_engine, value="deepl", command=self.update_engine_ui).pack(anchor="w", padx=20, pady=5)
-        ctk.CTkRadioButton(self.frame_left, text="Локальная Нейросеть (Лор)", variable=self.var_engine, value="ai", command=self.update_engine_ui).pack(anchor="w", padx=20, pady=5)
+        ctk.CTkRadioButton(self.frame_left, text="Локальная Нейросеть (GPU)", variable=self.var_engine, value="ai", command=self.update_engine_ui).pack(anchor="w", padx=20, pady=5)
 
         self.frame_deepl = ctk.CTkFrame(self.frame_left, fg_color="transparent")
         self.entry_deepl_key = ctk.CTkEntry(self.frame_deepl, placeholder_text="Введите API ключ DeepL...")
@@ -196,7 +308,17 @@ class TranslatorApp(ctk.CTk):
         self.frame_ai = ctk.CTkFrame(self.frame_left, fg_color="transparent")
         self.lbl_ai_model = ctk.CTkLabel(self.frame_ai, text="Модель не выбрана", text_color="yellow")
         self.lbl_ai_model.pack()
-        ctk.CTkButton(self.frame_ai, text="Выбрать .gguf модель", command=self.select_model, fg_color="#555").pack(fill="x")
+        ctk.CTkButton(self.frame_ai, text="Выбрать .gguf модель", command=self.select_model, fg_color="#555").pack(fill="x", pady=(0, 10))
+        
+        self.lbl_gpu = ctk.CTkLabel(self.frame_ai, text="Нагрузка GPU (Слои: 99 - Макс)", font=ctk.CTkFont(size=12))
+        self.lbl_gpu.pack(anchor="w", pady=(5, 0))
+        self.slider_gpu = ctk.CTkSlider(self.frame_ai, from_=0, to=99, number_of_steps=99, command=self.update_gpu_label)
+        self.slider_gpu.set(99)
+        self.slider_gpu.pack(fill="x", pady=(0, 5))
+        
+        self.var_ai_mode = ctk.StringVar(value="safe")
+        ctk.CTkRadioButton(self.frame_ai, text="Безопасный (По 20 строк)", variable=self.var_ai_mode, value="safe").pack(anchor="w", pady=2)
+        ctk.CTkRadioButton(self.frame_ai, text="Контекст + Лор (По 40 строк)", variable=self.var_ai_mode, value="context").pack(anchor="w", pady=2)
 
         ctk.CTkLabel(self.frame_left, text="РЕЖИМ ОБРАБОТКИ", font=ctk.CTkFont(size=14, weight="bold")).pack(pady=(15, 5))
         self.var_mode = ctk.StringVar(value="append")
@@ -209,6 +331,9 @@ class TranslatorApp(ctk.CTk):
         
         self.btn_start = ctk.CTkButton(self.frame_left, text="▶ НАЧАТЬ ПЕРЕВОД", fg_color="#28a745", hover_color="#218838", height=40, font=ctk.CTkFont(weight="bold"), command=self.start_translation)
         self.btn_start.pack(pady=5, fill="x", padx=20)
+
+        self.btn_pause = ctk.CTkButton(self.frame_left, text="⏸ ПАУЗА", fg_color="#ffc107", text_color="black", hover_color="#e0a800", height=40, font=ctk.CTkFont(weight="bold"), command=self.toggle_pause, state="disabled")
+        self.btn_pause.pack(pady=5, fill="x", padx=20)
 
         self.btn_stop = ctk.CTkButton(self.frame_left, text="⏹ ОСТАНОВИТЬ", fg_color="#dc3545", hover_color="#c82333", height=40, font=ctk.CTkFont(weight="bold"), command=self.stop_process, state="disabled")
         self.btn_stop.pack(pady=(5, 10), fill="x", padx=20)
@@ -239,9 +364,34 @@ class TranslatorApp(ctk.CTk):
         self.lbl_status.pack(pady=(0, 10))
 
         self.update_engine_ui()
+        self.update_output_ui()
 
-    def on_user_interaction(self, event=None):
-        self.auto_scroll = (self.textbox.yview()[1] >= 0.99)
+    def wait_if_paused(self):
+        while self.is_paused and self.is_running:
+            time.sleep(0.5)
+
+    def toggle_pause(self):
+        if self.is_paused:
+            self.is_paused = False
+            self.btn_pause.configure(text="⏸ ПАУЗА", fg_color="#ffc107", text_color="black")
+            self.log_colored("▶ Процесс возобновлен...", "green")
+        else:
+            self.is_paused = True
+            self.btn_pause.configure(text="▶ ПРОДОЛЖИТЬ", fg_color="#17a2b8", text_color="white")
+            self.log_colored("⏸ Процесс поставлен на паузу (ожидание текущего пакета)...", "yellow")
+
+    def update_gpu_label(self, value):
+        val = int(value)
+        text = f"Нагрузка GPU (Слои: {val})"
+        if val == 0: text += " - Только CPU"
+        elif val == 99: text += " - Макс"
+        self.lbl_gpu.configure(text=text)
+
+    def update_output_ui(self):
+        if self.var_output.get() == "resourcepack":
+            self.entry_rp_name.configure(state="normal")
+        else:
+            self.entry_rp_name.configure(state="disabled")
 
     def update_engine_ui(self):
         engine = self.var_engine.get()
@@ -249,6 +399,9 @@ class TranslatorApp(ctk.CTk):
         self.frame_ai.pack_forget()
         if engine == "deepl": self.frame_deepl.pack(fill="x", padx=20, pady=5)
         elif engine == "ai": self.frame_ai.pack(fill="x", padx=20, pady=5)
+
+    def on_user_interaction(self, event=None):
+        self.auto_scroll = (self.textbox.yview()[1] >= 0.99)
 
     def select_folder(self):
         folder = filedialog.askdirectory(title="Выберите папку профиля Minecraft")
@@ -294,9 +447,9 @@ class TranslatorApp(ctk.CTk):
 
     def update_eta(self):
         if not self.start_time or self.translated_strings == 0:
-            return "расчёт ETA..."
+            return "расчёт..."
         elapsed = time.time() - self.start_time
-        if elapsed < 5: return "расчёт ETA..."
+        if elapsed < 5: return "расчёт..."
         speed = self.translated_strings / elapsed
         remaining = self.total_strings - self.translated_strings
         if remaining <= 0: return "готово"
@@ -312,13 +465,19 @@ class TranslatorApp(ctk.CTk):
         self.btn_analyze.configure(state="disabled" if lock else "normal")
         self.btn_start.configure(state="disabled" if lock else "normal")
         self.btn_stop.configure(state="normal" if lock else "disabled")
+        self.btn_pause.configure(state="normal" if lock else "disabled")
 
     def stop_process(self):
         self.is_running = False
-        self.set_status("Остановка процесса... Пожалуйста, подождите.", 1.0)
+        self.is_paused = False
+        self.set_status("🛑 Остановка процесса... (Отключение ИИ)", 1.0)
         self.btn_stop.configure(state="disabled")
+        self.btn_pause.configure(state="disabled")
+        if self.ai_process:
+            try:
+                self.ai_process.terminate()
+            except: pass
 
-    # ================= ЛОГИКА АНАЛИЗА =================
     def start_analysis(self):
         self.lock_ui(True)
         self.is_running = True
@@ -348,6 +507,7 @@ class TranslatorApp(ctk.CTk):
 
         for i, filepath in enumerate(jar_files):
             if not self.is_running: break
+            self.wait_if_paused()
             mod_name = get_mod_name(filepath)
             self.set_status(f"Анализ мода: {mod_name}...", i / (len(jar_files) + 1))
             try:
@@ -355,23 +515,29 @@ class TranslatorApp(ctk.CTk):
                     trans_files = {item.filename.lower(): item for item in zin.infolist() if target_file in item.filename.lower() or f"/{lang_settings['file']}/" in item.filename.lower()}
                     
                     if self.var_mods.get():
+                        int_en_c, int_trans_c = 0, 0
                         for item in zin.infolist():
-                            if item.filename.lower().endswith('en_us.json') and 'patchouli' not in item.filename.lower() and 'lexicon' not in item.filename.lower():
+                            if item.filename.lower().endswith('en_us.json') and not any(x in item.filename.lower() for x in ('patchouli', 'lexicon', 'guide')):
                                 try:
                                     en_data = load_lenient_json(zin.read(item))
                                     trans_t = item.filename.lower().replace('en_us.json', target_file)
                                     trans_data = load_lenient_json(zin.read(trans_files[trans_t])) if trans_t in trans_files else {}
-                                    en_c = len([k for k, v in en_data.items() if isinstance(v, str) and re.search(r'[a-zA-Z]', v)])
-                                    trans_c = sum(1 for k, v in en_data.items() if isinstance(v, str) and re.search(r'[a-zA-Z]', v) and (str(trans_data.get(k,"")) != v and str(trans_data.get(k,"")).strip() != ""))
-                                    if en_c > 0:
-                                        total_en += en_c; total_trans += trans_c
-                                        self.log_table_row("📦", mod_name, "Интерфейс", trans_c, en_c, int(trans_c/en_c*100))
+                                    int_en_c += len([k for k, v in en_data.items() if isinstance(v, str) and re.search(r'[a-zA-Z]', v) and not is_technical_term(v)])
+                                    int_trans_c += sum(1 for k, v in en_data.items() if isinstance(v, str) and re.search(r'[a-zA-Z]', v) and not is_technical_term(v) and (str(trans_data.get(k,"")) != v and str(trans_data.get(k,"")).strip() != ""))
                                 except: pass
+                        if int_en_c > 0:
+                            total_en += int_en_c; total_trans += int_trans_c
+                            self.log_table_row("📦", mod_name, "Интерфейс", int_trans_c, int_en_c, int(int_trans_c/int_en_c*100))
 
                     if self.var_books.get():
+                        book_en_c, book_trans_c = 0, 0
+                        md_en_c, md_trans_c = 0, 0
                         for item in zin.infolist():
                             f_lower = item.filename.lower()
-                            if '/en_us/' in f_lower and f_lower.endswith('.json') and any(x in f_lower for x in ('patchouli', 'lexicon', 'guide')):
+                            is_json_book = f_lower.endswith('.json') and ('/en_us/' in f_lower) and any(x in f_lower for x in ('patchouli', 'lexicon', 'guide'))
+                            is_md_book = (f_lower.endswith('.md') or f_lower.endswith('.txt')) and any(x in f_lower for x in ('/en_us/', '/ae2guide/', '/guide/', '/manual/', '/lexicon/'))
+                            
+                            if is_json_book:
                                 try:
                                     en_data = load_lenient_json(zin.read(item))
                                     trans_t = f_lower.replace('/en_us/', f"/{lang_settings['file']}/")
@@ -380,10 +546,50 @@ class TranslatorApp(ctk.CTk):
                                     trans_strings = [s for s in extract_book_strings(trans_data) if s.strip()] if trans_data else []
                                     en_c = len(en_strings)
                                     trans_c = sum(1 for idx, s in enumerate(en_strings) if idx < len(trans_strings) and trans_strings[idx] != s)
-                                    if en_c > 0:
-                                        total_en += en_c; total_trans += trans_c
-                                        self.log_table_row("📖", mod_name, "Книга", trans_c, en_c, int(trans_c/en_c*100))
                                 except: pass
+                            elif is_md_book:
+                                try:
+                                    en_text = zin.read(item).decode('utf-8-sig', errors='ignore')
+                                    if '/en_us/' in f_lower:
+                                        trans_t = f_lower.replace('/en_us/', f"/{lang_settings['file']}/")
+                                    else:
+                                        trans_t = f_lower
+                                        
+                                    trans_text = zin.read(trans_files[trans_t]).decode('utf-8-sig', errors='ignore') if trans_t in trans_files else ""
+                                    en_lines = en_text.split('\n')
+                                    trans_lines = trans_text.split('\n') if trans_text else []
+                                    
+                                    in_yaml = False
+                                    for idx, s in enumerate(en_lines):
+                                        s_stripped = s.strip()
+                                        if s_stripped == '---':
+                                            in_yaml = not in_yaml
+                                            continue
+                                            
+                                        if in_yaml:
+                                            if s_stripped.lower().startswith('title:'):
+                                                match = re.match(r'^(\s*title\s*:\s*[\'"]?)(.*?)([\'"]?)$', s, re.IGNORECASE)
+                                                if match and re.search(r'[a-zA-Z]', match.group(2)):
+                                                    md_en_c += 1
+                                                    if idx < len(trans_lines) and re.search(l_regex, trans_lines[idx]): md_trans_c += 1
+                                            continue
+                                            
+                                        if s_stripped.startswith('<') or s_stripped.startswith('!['):
+                                            continue
+                                            
+                                        if s.strip() and re.search(r'[a-zA-Z]', s) and not is_technical_term(s):
+                                            md_en_c += 1
+                                            if idx < len(trans_lines) and re.search(l_regex, trans_lines[idx]):
+                                                md_trans_c += 1
+                                except: pass
+                                
+                        if book_en_c > 0:
+                            total_en += book_en_c; total_trans += book_trans_c
+                            self.log_table_row("📖", mod_name, "Книга(JSON)", book_trans_c, book_en_c, int(book_trans_c/book_en_c*100))
+                        if md_en_c > 0:
+                            total_en += md_en_c; total_trans += md_trans_c
+                            self.log_table_row("📝", mod_name, "Книга(MD)", md_trans_c, md_en_c, int(md_trans_c/md_en_c*100))
+
             except: pass
 
         snbt_files = []
@@ -393,6 +599,7 @@ class TranslatorApp(ctk.CTk):
                 
         for i, filepath in enumerate(snbt_files):
             if not self.is_running: break
+            self.wait_if_paused()
             self.set_status(f"Анализ квеста: {os.path.basename(filepath)}...", (len(jar_files) + i) / (len(jar_files) + len(snbt_files)))
             try:
                 with open(filepath, 'r', encoding='utf-8') as f: content = f.read()
@@ -421,14 +628,24 @@ class TranslatorApp(ctk.CTk):
         self.set_status("Готово", 1.0)
         self.lock_ui(False)
 
-    # ================= ЛОГИКА ПЕРЕВОДА =================
     def start_translation(self):
         self.lock_ui(True)
         self.is_running = True
+        self.is_paused = False
+        self.btn_pause.configure(text="⏸ ПАУЗА", fg_color="#ffc107", text_color="black")
         self.textbox.configure(state="normal")
         self.textbox.delete("1.0", "end")
         self.textbox.configure(state="disabled")
-        threading.Thread(target=self.run_translation, daemon=True).start()
+        threading.Thread(target=self._run_translation_wrapper, daemon=True).start()
+
+    def _run_translation_wrapper(self):
+        try:
+            self.run_translation()
+        except Exception as e:
+            error_text = traceback.format_exc()
+            self.log_colored(f"\n❌ КРИТИЧЕСКАЯ ОШИБКА ПРОГРАММЫ:\n{error_text}", "red")
+            self.set_status("Ошибка! Проверьте логи.")
+            self.lock_ui(False)
 
     def estimate_total_strings(self, jar_files, snbt_files, lang_settings, mode_overwrite):
         total = 0
@@ -437,31 +654,62 @@ class TranslatorApp(ctk.CTk):
 
         for filepath in jar_files:
             if not self.is_running: return total
+            self.wait_if_paused()
             try:
                 with zipfile.ZipFile(filepath, 'r') as zin:
                     trans_files = {item.filename.lower(): item for item in zin.infolist() 
                                    if target_file in item.filename.lower() or f"/{lang_settings['file']}/" in item.filename.lower()}
                     for item in zin.infolist():
                         f_lower = item.filename.lower()
-                        is_book = ('/en_us/' in f_lower and f_lower.endswith('.json') and any(x in f_lower for x in ('patchouli', 'lexicon', 'guide')))
-                        is_lang = (f_lower.endswith('en_us.json') and not is_book)
+                        is_json_book = f_lower.endswith('.json') and ('/en_us/' in f_lower) and any(x in f_lower for x in ('patchouli', 'lexicon', 'guide'))
+                        is_md_book = (f_lower.endswith('.md') or f_lower.endswith('.txt')) and any(x in f_lower for x in ('/en_us/', '/ae2guide/', '/guide/', '/manual/', '/lexicon/'))
+                        is_lang = (f_lower.endswith('en_us.json') and not is_json_book)
 
                         if self.var_mods.get() and is_lang:
-                            en_data = load_lenient_json(zin.read(item))
-                            trans_data = load_lenient_json(zin.read(trans_files.get(f_lower.replace('en_us.json', target_file), None))) if f_lower.replace('en_us.json', target_file) in trans_files else {}
+                            try: en_data = load_lenient_json(zin.read(item))
+                            except: continue
+                            try: trans_data = load_lenient_json(zin.read(trans_files.get(f_lower.replace('en_us.json', target_file), None))) if f_lower.replace('en_us.json', target_file) in trans_files else {}
+                            except: trans_data = {}
+                            
                             for k, v in en_data.items():
                                 if isinstance(v, str) and re.search(r'[a-zA-Z]', v) and not is_technical_term(v):
-                                    if mode_overwrite == "force" or not (k in trans_data and trans_data[k].strip()):
+                                    if mode_overwrite == "force" or not (k in trans_data and isinstance(trans_data[k], str) and trans_data[k].strip()):
                                         total += 1
 
-                        elif self.var_books.get() and is_book:
-                            en_data = load_lenient_json(zin.read(item))
+                        elif self.var_books.get() and is_json_book:
+                            try: en_data = load_lenient_json(zin.read(item))
+                            except: continue
                             en_strings = [s for s in extract_book_strings(en_data) if s.strip() and re.search(r'[a-zA-Z]', s) and not is_technical_term(s)]
                             total += len(en_strings)
+                            
+                        elif self.var_books.get() and is_md_book:
+                            try: en_text = zin.read(item).decode('utf-8-sig', errors='ignore')
+                            except: continue
+                            en_lines = en_text.split('\n')
+                            in_yaml = False
+                            for en_s in en_lines:
+                                s_stripped = en_s.strip()
+                                if s_stripped == '---':
+                                    in_yaml = not in_yaml
+                                    continue
+                                    
+                                if in_yaml:
+                                    if s_stripped.lower().startswith('title:'):
+                                        match = re.match(r'^(\s*title\s*:\s*[\'"]?)(.*?)([\'"]?)$', en_s, re.IGNORECASE)
+                                        if match and re.search(r'[a-zA-Z]', match.group(2)):
+                                            total += 1
+                                    continue
+                                    
+                                if s_stripped.startswith('<') or s_stripped.startswith('!['):
+                                    continue
+                                    
+                                if en_s.strip() and re.search(r'[a-zA-Z]', en_s) and not is_technical_term(en_s):
+                                    total += 1
             except: pass
 
         for filepath in snbt_files:
             if not self.is_running: return total
+            self.wait_if_paused()
             try:
                 with open(filepath, 'r', encoding='utf-8') as f: content = f.read()
                 strings = re.findall(r'(?:"|)(?:title|subtitle|text)(?:"|)\s*:\s*"((?:[^"\\]|\\.)*)"', content, re.IGNORECASE)
@@ -476,8 +724,15 @@ class TranslatorApp(ctk.CTk):
         return total
 
     def run_translation(self):
-        lang_settings = LANGUAGES[self.var_lang.get()]
         engine = self.var_engine.get()
+        if engine == "ai":
+            self.active_cache = self.cache_ai
+            self.active_cache_file = CACHE_FILE_AI
+        else:
+            self.active_cache = self.cache_std
+            self.active_cache_file = CACHE_FILE_STD
+
+        lang_settings = LANGUAGES[self.var_lang.get()]
         mode_overwrite = self.var_mode.get()
         output_mode = self.var_output.get()
         
@@ -513,30 +768,42 @@ class TranslatorApp(ctk.CTk):
             self.lock_ui(False); return
 
         rp_zip_path = None
+        rp_zip_handle = None
+        written_files = set()
+        
         if output_mode == "resourcepack":
             if not os.path.exists(rp_dir): os.makedirs(rp_dir)
-            rp_zip_path = os.path.join(rp_dir, f"MineAI_{lang_settings['name']}_Pack.zip")
             
-            if os.path.exists(rp_zip_path):
-                self.log_colored("📦 Найден старый ресурспак — сохраняем все предыдущие переводы...", "yellow")
-                backup = rp_zip_path + ".backup"
-                if os.path.exists(backup): os.remove(backup)
-                shutil.copy2(rp_zip_path, backup)
+            base_rp_name = self.entry_rp_name.get().strip()
+            base_rp_name = re.sub(r'[\\/*?:"<>|]', "", base_rp_name)
+            if not base_rp_name: base_rp_name = f"MineAI_{lang_settings['name']}_Pack"
+            if not base_rp_name.lower().endswith(".zip"): base_rp_name += ".zip"
                 
-                with zipfile.ZipFile(rp_zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as new_z:
-                    with zipfile.ZipFile(backup, 'r') as old_z:
-                        for item in old_z.infolist():
-                            new_z.writestr(item, old_z.read(item))
-                    mcmeta = {"pack": {"pack_format": 15, "description": f"Auto-translated by MineAI ({lang_settings['name']}) — Updated {time.strftime('%Y-%m-%d')}" }}
-                    new_z.writestr("pack.mcmeta", json.dumps(mcmeta, indent=2))
-                self.log_colored("   Все старые переводы успешно перенесены!", "green")
-            else:
-                with zipfile.ZipFile(rp_zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as zout:
-                    mcmeta = {"pack": {"pack_format": 15, "description": f"Auto-translated by MineAI ({lang_settings['name']})"}}
-                    zout.writestr("pack.mcmeta", json.dumps(mcmeta, indent=2))
-            self.log_colored(f"📦 Умный ресурспак: {rp_zip_path}", "cyan")
+            rp_name = base_rp_name
+            counter = 1
+            while True:
+                rp_zip_path = os.path.join(rp_dir, rp_name)
+                if os.path.exists(rp_zip_path):
+                    try: 
+                        os.remove(rp_zip_path)
+                        self.log_colored(f"🗑️ Старый архив {rp_name} успешно очищен", "yellow")
+                        break
+                    except Exception:
+                        self.log_colored(f"⚠️ Архив {rp_name} занят игрой! Создаем копию...", "yellow")
+                        rp_name = base_rp_name.replace(".zip", f"_{counter}.zip")
+                        counter += 1
+                else:
+                    break
+            
+            with zipfile.ZipFile(rp_zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as zout:
+                mcmeta = {"pack": {"pack_format": 15, "description": f"{rp_name.replace('.zip', '')} - Translated by MineAI"}}
+                zout.writestr("pack.mcmeta", json.dumps(mcmeta, indent=2))
+                written_files.add("pack.mcmeta")
+            
+            rp_zip_handle = zipfile.ZipFile(rp_zip_path, 'a', compression=zipfile.ZIP_DEFLATED)
+            self.log_colored(f"📦 Создан свежий ресурспак: {rp_zip_path}", "cyan")
 
-        self.log_colored(f"🚀 ЗАПУСК ПЕРЕВОДА ({lang_settings['name']})...\n", "yellow")
+        self.log_colored(f"🚀 ЗАПУСК ПЕРЕВОДА ({lang_settings['name']}) [База: {self.active_cache_file}]...\n", "yellow")
         
         self.start_time = time.time()
         self.translated_strings = 0
@@ -544,21 +811,29 @@ class TranslatorApp(ctk.CTk):
         self.auto_scroll = True
 
         processed = 0
-        for filepath in jar_files:
-            if not self.is_running: break
-            self.process_jar(filepath, engine, mode_overwrite, output_mode, lang_settings, rp_zip_path)
-            processed += 1
-            self.set_status(f"Обработано модов: {processed}/{len(jar_files)} | {self.update_eta()}", processed / total_files)
-            
-        for filepath in snbt_files:
-            if not self.is_running: break
-            self.process_snbt(filepath, engine, mode_overwrite, lang_settings)
-            processed += 1
-            self.set_status(f"Обработано квестов: {processed}/{total_files} | {self.update_eta()}", processed / total_files)
+        
+        try:
+            for filepath in jar_files:
+                if not self.is_running: break
+                self.wait_if_paused()
+                self.process_jar(filepath, engine, mode_overwrite, output_mode, lang_settings, rp_zip_path, rp_zip_handle, written_files)
+                processed += 1
+                self.set_status(f"Обработано модов: {processed}/{len(jar_files)} | ETA: {self.update_eta()}", processed / total_files)
+                
+            for filepath in snbt_files:
+                if not self.is_running: break
+                self.wait_if_paused()
+                self.process_snbt(filepath, engine, mode_overwrite, lang_settings)
+                processed += 1
+                self.set_status(f"Обработано квестов: {processed}/{total_files} | ETA: {self.update_eta()}", processed / total_files)
 
-        save_cache()
+            save_cache_data(self.active_cache, self.active_cache_file)
+        finally:
+            if rp_zip_handle:
+                rp_zip_handle.close()
+
         if not self.is_running:
-            self.log_colored("\n🛑 ПРОЦЕСС ОСТАНОВЛЕН. Кэш сохранен.", "red")
+            self.log_colored("\n🛑 ПРОЦЕСС ОСТАНОВЛЕН ПОЛЬЗОВАТЕЛЕМ. Кэш сохранен.", "red")
         else:
             self.log_colored("\n✅ ГЛОБАЛЬНЫЙ ПЕРЕВОД УСПЕШНО ЗАВЕРШЕН!", "green")
             if output_mode == "resourcepack":
@@ -567,7 +842,9 @@ class TranslatorApp(ctk.CTk):
                     self.log_colored("📜 Квесты сохранены напрямую в config.", "dim")
         
         self.set_status("Все задачи выполнены!" if self.is_running else "Остановлено", 1.0)
-        if self.ai_process: self.ai_process.terminate()
+        if self.ai_process: 
+            try: self.ai_process.terminate() 
+            except: pass
         self.lock_ui(False)
 
     def setup_and_start_ai(self):
@@ -579,34 +856,53 @@ class TranslatorApp(ctk.CTk):
 
         self.log_colored(f"🤖 Запуск ИИ: {os.path.basename(self.ai_model_path)}...", "cyan")
         kobold_exe = os.path.join(AI_DIR, "koboldcpp.exe") if os.path.exists(os.path.join(AI_DIR, "koboldcpp.exe")) else "koboldcpp"
+        
+        gpu_layers = str(int(self.slider_gpu.get()))
+        
         try:
-            self.ai_process = subprocess.Popen([kobold_exe, self.ai_model_path, "--port", "5001", "--quiet"], stdout=subprocess.DEVNULL)
+            self.ai_process = subprocess.Popen([
+                kobold_exe, self.ai_model_path, 
+                "--port", "5001", 
+                "--quiet", 
+                "--contextsize", "8192",
+                "--usecublas",       
+                "--gpulayers", gpu_layers  
+            ], stdout=subprocess.DEVNULL)
         except Exception as e:
             self.log_colored(f"❌ Ошибка запуска ИИ: {e}", "red")
             return False
             
-        for i in range(60):
+        for i in range(180):
             if not self.is_running: return False
-            self.set_status(f"Прогрев нейросети... ({i}/60 сек)")
+            self.set_status(f"Прогрев нейросети... ({i}/180 сек) Загрузка в VRAM...")
             try:
                 if requests.get(KOBOLD_API.replace("chat/completions", "models"), timeout=1).status_code == 200:
                     self.log_colored("✅ ИИ успешно запущен!\n", "green")
                     return True
             except: time.sleep(1)
-        self.log_colored("❌ Сервер ИИ не отвечает", "red")
+        self.log_colored("❌ Сервер ИИ не отвечает после 3 минут. Попробуйте еще раз.", "red")
         return False
 
-    def translate_engine(self, data_dict, engine, lang_settings):
+    def translate_engine(self, data_dict, engine, lang_settings, context_name=""):
         keys = list(data_dict.keys())
         result = {}
         to_translate = {}
+        in_cache_count = 0
         
         for k in keys:
             if not self.is_running: break
+            self.wait_if_paused()
+            
             text = data_dict[k]
             cache_key = f"{lang_settings['api']}_{text}"
-            if cache_key in translation_cache:
-                result[k] = translation_cache[cache_key]
+            
+            if cache_key in self.active_cache:
+                result[k] = self.active_cache[cache_key]
+                in_cache_count += 1
+                self.translated_strings += 1
+                if time.time() - self.last_eta_update > 0.5: 
+                    self.set_status(f"Чтение кэша: {self.translated_strings}/{self.total_strings} | ETA: {self.update_eta()}")
+                    self.last_eta_update = time.time()
                 continue
                 
             mapping = {}
@@ -621,11 +917,16 @@ class TranslatorApp(ctk.CTk):
             
             if not masked:
                 result[k] = text
+                self.translated_strings += 1
                 continue
                 
             to_translate[k] = {"original": text, "masked": masked, "mapping": mapping}
 
-        if not to_translate or not self.is_running: return result
+        if in_cache_count > 0:
+            self.log_colored(f"   🗃️ Мгновенно взято из кэша: {in_cache_count} строк", "dim")
+
+        if not to_translate or not self.is_running: 
+            return result
 
         if engine == "google":
             chunks = []
@@ -644,7 +945,10 @@ class TranslatorApp(ctk.CTk):
                     if not self.is_running: return chunk_keys, None
                     try:
                         res = requests.get("https://translate.googleapis.com/translate_a/single", params={"client": "gtx", "sl": "en", "tl": lang_settings['api'], "dt": "t", "q": text_to_send}, timeout=10)
-                        if res.status_code == 429: time.sleep(3); continue
+                        if res.status_code == 429: 
+                            self.set_status("⚠️ Пауза 3 сек (защита от спама Google)...")
+                            time.sleep(3)
+                            continue
                         parts = re.split(r'\s*\|\s*~\s*\|\s*', "".join([p[0] for p in res.json()[0] if p[0]]))
                         if len(parts) == len(chunk_keys): return chunk_keys, parts
                     except: time.sleep(1)
@@ -654,17 +958,21 @@ class TranslatorApp(ctk.CTk):
                 futures = [executor.submit(translate_chunk, ck, txt) for ck, txt in chunks]
                 for future in as_completed(futures):
                     if not self.is_running: break
+                    self.wait_if_paused()
                     c_keys, c_parts = future.result()
                     if c_parts:
                         for idx, k in enumerate(c_keys):
                             trans = c_parts[idx].strip()
                             for m_idx, (m, orig) in enumerate(to_translate[k]["mapping"].items()):
                                 trans = re.sub(rf'\[\s*#\s*{m_idx}\s*#\s*\]', lambda x, o=orig: o, trans)
+                            
+                            trans = polish_translation(trans)
                             result[k] = trans
-                            translation_cache[f"{lang_settings['api']}_{to_translate[k]['original']}"] = trans 
+                            self.active_cache[f"{lang_settings['api']}_{to_translate[k]['original']}"] = trans 
+                            
                             self.translated_strings += 1
                             if time.time() - self.last_eta_update > 2:
-                                self.set_status(f"Перевод строк: {self.translated_strings}/{self.total_strings} | {self.update_eta()}")
+                                self.set_status(f"Перевод строк: {self.translated_strings}/{self.total_strings} | ETA: {self.update_eta()}")
                                 self.last_eta_update = time.time()
                             self.log_colored(f" > {to_translate[k]['original'][:40]} -> {trans[:40]}", "dim")
                     else:
@@ -675,11 +983,14 @@ class TranslatorApp(ctk.CTk):
                                 trans = "".join([p[0] for p in res[0] if p[0]])
                                 for m_idx, (m, orig) in enumerate(to_translate[k]["mapping"].items()):
                                     trans = re.sub(rf'\[\s*#\s*{m_idx}\s*#\s*\]', lambda x, o=orig: o, trans)
+                                
+                                trans = polish_translation(trans)
                                 result[k] = trans
-                                translation_cache[f"{lang_settings['api']}_{to_translate[k]['original']}"] = trans
+                                self.active_cache[f"{lang_settings['api']}_{to_translate[k]['original']}"] = trans
+                                
                                 self.translated_strings += 1
                                 if time.time() - self.last_eta_update > 2:
-                                    self.set_status(f"Перевод строк: {self.translated_strings}/{self.total_strings} | {self.update_eta()}")
+                                    self.set_status(f"Перевод строк: {self.translated_strings}/{self.total_strings} | ETA: {self.update_eta()}")
                                     self.last_eta_update = time.time()
                                 self.log_colored(f" > {to_translate[k]['original'][:40]} -> {trans[:40]}", "dim")
                             except: result[k] = to_translate[k]["original"]
@@ -691,6 +1002,7 @@ class TranslatorApp(ctk.CTk):
             b_keys = list(to_translate.keys())
             for i in range(0, len(b_keys), 40):
                 if not self.is_running: break
+                self.wait_if_paused()
                 chunk_keys = b_keys[i:i+40]
                 texts = [to_translate[k]["masked"] for k in chunk_keys]
                 try:
@@ -699,11 +1011,14 @@ class TranslatorApp(ctk.CTk):
                         trans = res["translations"][idx]["text"]
                         for m_idx, (m, orig) in enumerate(to_translate[k]["mapping"].items()):
                             trans = re.sub(rf'\[\s*#\s*{m_idx}\s*#\s*\]', lambda x, o=orig: o, trans)
+                        
+                        trans = polish_translation(trans)
                         result[k] = trans
-                        translation_cache[f"{lang_settings['api']}_{to_translate[k]['original']}"] = trans
+                        self.active_cache[f"{lang_settings['api']}_{to_translate[k]['original']}"] = trans
+                        
                         self.translated_strings += 1
                         if time.time() - self.last_eta_update > 2:
-                            self.set_status(f"Перевод строк: {self.translated_strings}/{self.total_strings} | {self.update_eta()}")
+                            self.set_status(f"Перевод строк: {self.translated_strings}/{self.total_strings} | ETA: {self.update_eta()}")
                             self.last_eta_update = time.time()
                         self.log_colored(f" > {to_translate[k]['original'][:40]} -> {trans[:40]}", "dim")
                 except Exception as e:
@@ -712,36 +1027,85 @@ class TranslatorApp(ctk.CTk):
                 time.sleep(0.5)
 
         else:  # AI
+            ai_mode = self.var_ai_mode.get() if hasattr(self, 'var_ai_mode') else "safe"
+            base_batch_size = 40 if ai_mode == "context" else 20
+            max_tok = 4096 if ai_mode == "context" else 2048
+            
             batch_keys = list(to_translate.keys())
-            for i in range(0, len(batch_keys), 20):
-                if not self.is_running: break
-                b_keys = batch_keys[i:i+20]
-                b_dict = {k: to_translate[k]["masked"] for k in b_keys}
-                prompt = f"Translate the following JSON string values from English to {lang_settings['name']}. RULES: Do not translate keys. Preserve [#0#] tags exactly. Return ONLY valid JSON. Text: {json.dumps(b_dict, ensure_ascii=False)}"
+
+            def process_ai_chunk(chunk_keys):
+                if not self.is_running: return False
+                sub_dict = {k: to_translate[k]["masked"] for k in chunk_keys}
+                
+                if ai_mode == "context" and context_name:
+                    prompt = f"Ты локализатор. Переведи текст мода/квеста '{context_name}' на {lang_settings['name']}. Адаптируй лор мода. ПРАВИЛА: Не переводи ключи. Сохраняй [#0#]. Верни ТОЛЬКО валидный JSON. Текст: {json.dumps(sub_dict, ensure_ascii=False)}"
+                else:
+                    prompt = f"Translate the following JSON string values from English to {lang_settings['name']}. RULES: Do not translate keys. Preserve [#0#] tags exactly. Return ONLY valid JSON. Text: {json.dumps(sub_dict, ensure_ascii=False)}"
+                
+                self.set_status(f"⏳ ИИ переводит (пакет {len(chunk_keys)} строк)... | ETA: {self.update_eta()}")
                 try:
-                    res = requests.post(KOBOLD_API, json={"messages": [{"role": "user", "content": prompt}], "temperature": 0.1, "max_tokens": 2048}, timeout=120).json()
-                    trans_text = re.sub(r'^```json\s*|^```\s*|```$', '', res['choices'][0]['message']['content'].strip(), flags=re.IGNORECASE).strip()
+                    res = requests.post(KOBOLD_API, json={"messages": [{"role": "user", "content": prompt}], "temperature": 0.1, "max_tokens": max_tok}, timeout=300)
+                    res.raise_for_status()
+                    data = res.json()
+                    
+                    trans_text = re.sub(r'^```json\s*|^```\s*|```$', '', data['choices'][0]['message']['content'].strip(), flags=re.IGNORECASE).strip()
                     trans_dict = json.loads(trans_text, strict=False)
-                    for k in b_keys:
+                    
+                    for k in chunk_keys:
                         if k in trans_dict:
                             trans = trans_dict[k]
                             for m_idx, (m, orig) in enumerate(to_translate[k]["mapping"].items()):
                                 trans = re.sub(rf'\[\s*#\s*{m_idx}\s*#\s*\]', lambda x, o=orig: o, trans)
+                            
+                            trans = polish_translation(trans)
                             result[k] = trans
-                            translation_cache[f"{lang_settings['api']}_{to_translate[k]['original']}"] = trans
+                            self.active_cache[f"{lang_settings['api']}_{to_translate[k]['original']}"] = trans
+                            
                             self.translated_strings += 1
-                            if time.time() - self.last_eta_update > 2:
-                                self.set_status(f"Перевод строк: {self.translated_strings}/{self.total_strings} | {self.update_eta()}")
-                                self.last_eta_update = time.time()
                             self.log_colored(f" > {to_translate[k]['original'][:40]} -> {trans[:40]}", "dim")
-                        else: result[k] = to_translate[k]["original"]
-                except:
-                    for k in b_keys: result[k] = to_translate[k]["original"]
+                        else: 
+                            result[k] = to_translate[k]["original"]
+                            self.translated_strings += 1
+                            self.log_colored(f" ⚠️ ИИ пропустил фразу: {to_translate[k]['original'][:30]}...", "yellow")
+                    return True
+                except requests.exceptions.RequestException:
+                    return False 
+                except Exception:
+                    return False 
 
-        if len(translation_cache) % 50 == 0: save_cache()
+            i = 0
+            while i < len(batch_keys):
+                if not self.is_running: break
+                self.wait_if_paused()
+                b_keys = batch_keys[i:i+base_batch_size]
+                
+                success = process_ai_chunk(b_keys)
+                
+                if not success and self.is_running:
+                    self.log_colored(f"❌ Ошибка ИИ (сломанный код). Дробим пакет на части по 10 строк...", "yellow")
+                    for j in range(0, len(b_keys), 10):
+                        if not self.is_running: break
+                        self.wait_if_paused()
+                        sub_keys = b_keys[j:j+10]
+                        sub_success = process_ai_chunk(sub_keys)
+                        if not sub_success and self.is_running:
+                            self.log_colored(f"❌ Критическая ошибка ИИ подпакета. Откат {len(sub_keys)} строк к английскому.", "red")
+                            for k in sub_keys:
+                                result[k] = to_translate[k]["original"]
+                                self.translated_strings += 1
+                
+                if time.time() - self.last_eta_update > 2:
+                    self.set_status(f"Перевод строк: {self.translated_strings}/{self.total_strings} | ETA: {self.update_eta()}")
+                    self.last_eta_update = time.time()
+                    
+                i += base_batch_size
+
+        if len(self.active_cache) % 500 == 0: save_cache_data(self.active_cache, self.active_cache_file)
         return result
 
-    def process_jar(self, filepath, engine, mode_overwrite, output_mode, lang_settings, rp_zip_path):
+    def process_jar(self, filepath, engine, mode_overwrite, output_mode, lang_settings, rp_zip_path, rp_zip_handle=None, written_files=None):
+        if written_files is None: written_files = set()
+        if not self.var_mods.get() and not self.var_books.get(): return
         mod_name = get_mod_name(filepath)
         target_file = f"{lang_settings['file']}.json"
         temp_filepath = filepath + ".temp"
@@ -756,9 +1120,11 @@ class TranslatorApp(ctk.CTk):
 
                     for item in zin.infolist():
                         if not self.is_running: break
+                        self.wait_if_paused()
                         f_lower = item.filename.lower()
-                        is_book = ('/en_us/' in f_lower and f_lower.endswith('.json') and any(x in f_lower for x in ('patchouli', 'lexicon', 'guide')))
-                        is_lang = (f_lower.endswith('en_us.json') and not is_book)
+                        is_json_book = f_lower.endswith('.json') and ('/en_us/' in f_lower) and any(x in f_lower for x in ('patchouli', 'lexicon', 'guide'))
+                        is_md_book = (f_lower.endswith('.md') or f_lower.endswith('.txt')) and any(x in f_lower for x in ('/en_us/', '/ae2guide/', '/guide/', '/manual/', '/lexicon/'))
+                        is_lang = (f_lower.endswith('en_us.json') and not is_json_book)
                         
                         if output_mode == "inplace" and target_file not in f_lower and f"/{lang_settings['file']}/" not in f_lower:
                             zout.writestr(item, zin.read(item))
@@ -767,16 +1133,11 @@ class TranslatorApp(ctk.CTk):
                             trans_filename = re.sub(r'en_us\.json$', target_file, item.filename, flags=re.IGNORECASE)
                             trans_t = trans_filename.lower()
                             
-                            try:
-                                en_data = load_lenient_json(zin.read(item))
-                            except Exception as e:
-                                self.log_colored(f"⚠️ Пропуск файла {item.filename} (ОШИБКА АВТОРА МОДА: сломанный синтаксис JSON)", "yellow")
-                                continue
+                            try: en_data = load_lenient_json(zin.read(item))
+                            except: continue
                                 
-                            try:
-                                trans_data = load_lenient_json(zin.read(trans_files[trans_t])) if trans_t in trans_files else {}
-                            except:
-                                trans_data = {}
+                            try: trans_data = load_lenient_json(zin.read(trans_files[trans_t])) if trans_t in trans_files else {}
+                            except: trans_data = {}
                             
                             final_data = en_data.copy()
                             keys_to_translate = {}
@@ -795,41 +1156,39 @@ class TranslatorApp(ctk.CTk):
                             if total_en > 0:
                                 if mode_overwrite == "skip" and (total_en - len(keys_to_translate)) >= total_en * 0.9:
                                     self.log_colored(f"⏩ {mod_name} [Интерфейс]: Пропуск", "yellow")
-                                    if output_mode == "resourcepack" and trans_t in trans_files:
-                                        with zipfile.ZipFile(rp_zip_path, 'a', compression=zipfile.ZIP_DEFLATED) as rz:
-                                            rz.writestr(trans_filename, zin.read(trans_files[trans_t]))
+                                    if output_mode == "resourcepack" and trans_t in trans_files and rp_zip_handle:
+                                        if trans_filename not in written_files:
+                                            rp_zip_handle.writestr(trans_filename, zin.read(trans_files[trans_t]))
+                                            written_files.add(trans_filename)
                                 elif len(keys_to_translate) == 0 and mode_overwrite == "append":
-                                    if output_mode == "resourcepack":
-                                        with zipfile.ZipFile(rp_zip_path, 'a', compression=zipfile.ZIP_DEFLATED) as rz:
-                                            rz.writestr(trans_filename, json.dumps(final_data, ensure_ascii=False, indent=2).encode('utf-8'))
+                                    if output_mode == "resourcepack" and rp_zip_handle:
+                                        if trans_filename not in written_files:
+                                            rp_zip_handle.writestr(trans_filename, json.dumps(final_data, ensure_ascii=False, indent=2).encode('utf-8'))
+                                            written_files.add(trans_filename)
                                     translated_any = True
                                 else:
                                     self.log_colored(f"⚡ Перевод {mod_name} [Интерфейс] - {len(keys_to_translate)} строк", "cyan")
-                                    trans_dict = self.translate_engine(keys_to_translate, engine, lang_settings)
+                                    trans_dict = self.translate_engine(keys_to_translate, engine, lang_settings, context_name=mod_name)
                                     for k, v in trans_dict.items(): final_data[k] = v
                                     out_data = json.dumps(final_data, ensure_ascii=False, indent=2).encode('utf-8')
-                                    if output_mode == "resourcepack":
-                                        with zipfile.ZipFile(rp_zip_path, 'a', compression=zipfile.ZIP_DEFLATED) as rz:
-                                            rz.writestr(trans_filename, out_data)
+                                    if output_mode == "resourcepack" and rp_zip_handle:
+                                        if trans_filename not in written_files:
+                                            rp_zip_handle.writestr(trans_filename, out_data)
+                                            written_files.add(trans_filename)
                                     else:
-                                        zout.writestr(trans_filename, out_data)
+                                        if zout: zout.writestr(trans_filename, out_data)
                                         ru_files_written.add(trans_filename)
                                     translated_any = True
 
-                        elif self.var_books.get() and is_book:
+                        elif self.var_books.get() and is_json_book:
                             trans_filename = re.sub(r'/en_us/', f"/{lang_settings['file']}/", item.filename, flags=re.IGNORECASE)
                             trans_t = trans_filename.lower()
                             
-                            try:
-                                en_data = load_lenient_json(zin.read(item))
-                            except Exception as e:
-                                self.log_colored(f"⚠️ Пропуск книги {item.filename} (ОШИБКА АВТОРА МОДА: сломанный синтаксис JSON)", "yellow")
-                                continue
+                            try: en_data = load_lenient_json(zin.read(item))
+                            except: continue
                                 
-                            try:
-                                trans_data = load_lenient_json(zin.read(trans_files[trans_t])) if trans_t in trans_files else {}
-                            except:
-                                trans_data = {}
+                            try: trans_data = load_lenient_json(zin.read(trans_files[trans_t])) if trans_t in trans_files else {}
+                            except: trans_data = {}
                             
                             en_strings = [s for s in extract_book_strings(en_data) if s.strip()]
                             trans_strings = [s for s in extract_book_strings(trans_data) if s.strip()] if trans_data else []
@@ -851,32 +1210,146 @@ class TranslatorApp(ctk.CTk):
                             total_en = len([s for s in en_strings if re.search(r'[a-zA-Z]', s) and not is_technical_term(s)])
                             if total_en > 0:
                                 if mode_overwrite == "skip" and (total_en - len(keys_to_translate)) >= total_en * 0.9:
-                                    self.log_colored(f"⏩ {mod_name} [Книга]: Пропуск", "yellow")
-                                    if output_mode == "resourcepack" and trans_t in trans_files:
-                                        with zipfile.ZipFile(rp_zip_path, 'a', compression=zipfile.ZIP_DEFLATED) as rz:
-                                            rz.writestr(trans_filename, zin.read(trans_files[trans_t]))
+                                    self.log_colored(f"⏩ {mod_name} [Книга JSON]: Пропуск", "yellow")
+                                    if output_mode == "resourcepack" and trans_t in trans_files and rp_zip_handle:
+                                        if trans_filename not in written_files:
+                                            rp_zip_handle.writestr(trans_filename, zin.read(trans_files[trans_t]))
+                                            written_files.add(trans_filename)
                                 elif len(keys_to_translate) == 0 and mode_overwrite == "append":
-                                    if output_mode == "resourcepack":
-                                        inject_book_strings(en_data, iter(final_strings))
-                                        with zipfile.ZipFile(rp_zip_path, 'a', compression=zipfile.ZIP_DEFLATED) as rz:
-                                            rz.writestr(trans_filename, json.dumps(en_data, ensure_ascii=False, indent=2).encode('utf-8'))
+                                    if output_mode == "resourcepack" and rp_zip_handle:
+                                        if trans_filename not in written_files:
+                                            inject_book_strings(en_data, iter(final_strings))
+                                            rp_zip_handle.writestr(trans_filename, json.dumps(en_data, ensure_ascii=False, indent=2).encode('utf-8'))
+                                            written_files.add(trans_filename)
                                     translated_any = True
                                 else:
-                                    self.log_colored(f"⚡ Перевод {mod_name} [Книга] - {len(keys_to_translate)} строк", "magenta")
-                                    trans_dict = self.translate_engine(keys_to_translate, engine, lang_settings)
+                                    self.log_colored(f"⚡ Перевод {mod_name} [Книга JSON] - {len(keys_to_translate)} строк", "magenta")
+                                    trans_dict = self.translate_engine(keys_to_translate, engine, lang_settings, context_name=mod_name)
                                     for i in range(len(final_strings)):
                                         if str(i) in trans_dict: final_strings[i] = trans_dict[str(i)]
                                     inject_book_strings(en_data, iter(final_strings))
                                     out_data = json.dumps(en_data, ensure_ascii=False, indent=2).encode('utf-8')
-                                    if output_mode == "resourcepack":
-                                        with zipfile.ZipFile(rp_zip_path, 'a', compression=zipfile.ZIP_DEFLATED) as rz:
-                                            rz.writestr(trans_filename, out_data)
+                                    if output_mode == "resourcepack" and rp_zip_handle:
+                                        if trans_filename not in written_files:
+                                            rp_zip_handle.writestr(trans_filename, out_data)
+                                            written_files.add(trans_filename)
                                     else:
-                                        zout.writestr(trans_filename, out_data)
+                                        if zout: zout.writestr(trans_filename, out_data)
                                         ru_files_written.add(trans_filename)
                                     translated_any = True
 
-                    if output_mode == "inplace":
+                        elif self.var_books.get() and is_md_book:
+                            # =========================================================================
+                            # ПУТИ КАК В РАБОЧЕМ РЕСУРСПАКЕ
+                            # =========================================================================
+                            if '/en_us/' in f_lower:
+                                trans_filename = re.sub(r'/en_us/', f"/{lang_settings['file']}/", item.filename, flags=re.IGNORECASE)
+                            else:
+                                trans_filename = item.filename
+                                
+                            trans_t = trans_filename.lower()
+                            l_regex = lang_settings.get('regex', r'[А-Яа-яЁё]')
+                            
+                            try: en_text = zin.read(item).decode('utf-8-sig', errors='ignore')
+                            except: continue
+                            try: trans_text = zin.read(trans_files[trans_t]).decode('utf-8-sig', errors='ignore') if trans_t in trans_files else ""
+                            except: trans_text = ""
+                            
+                            en_lines = en_text.split('\n')
+                            trans_lines = trans_text.split('\n') if trans_text else []
+                            
+                            keys_to_translate = {}
+                            md_prefixes = {}
+                            final_lines = []
+                            
+                            in_yaml_header = False
+                            
+                            for i, en_s in enumerate(en_lines):
+                                s_stripped = en_s.strip()
+                                
+                                # ПАРСЕР ШАПКИ YAML (Где происходили краши AE2)
+                                if s_stripped == '---':
+                                    in_yaml_header = not in_yaml_header
+                                    final_lines.append(en_s)
+                                    if mode_overwrite == "append" and i < len(trans_lines) and trans_lines[i].strip() == '---':
+                                        pass
+                                    continue
+                                    
+                                if in_yaml_header:
+                                    # Внутри шапки переводим ТОЛЬКО title:
+                                    if s_stripped.lower().startswith('title:'):
+                                        match = re.match(r'^(\s*title\s*:\s*[\'"]?)(.*?)([\'"]?)$', en_s, re.IGNORECASE)
+                                        if match and re.search(r'[a-zA-Z]', match.group(2)):
+                                            prefix, text_to_trans, suffix = match.groups()
+                                            md_prefixes[str(i)] = (prefix, suffix)
+                                            
+                                            if mode_overwrite == "append" and i < len(trans_lines) and re.search(l_regex, trans_lines[i]):
+                                                final_lines.append(trans_lines[i])
+                                            else:
+                                                final_lines.append(en_s) # Плейсхолдер
+                                                keys_to_translate[str(i)] = text_to_trans
+                                        else:
+                                            final_lines.append(en_s)
+                                    else:
+                                        final_lines.append(en_s) # Оставляем системные команды на английском!
+                                    continue
+                                
+                                # ОБРАБОТКА ОБЫЧНОГО ТЕКСТА
+                                if s_stripped.startswith('<') or s_stripped.startswith('!['):
+                                    final_lines.append(en_s)
+                                    continue
+                                    
+                                if not s_stripped or not re.search(r'[a-zA-Z]', en_s) or is_technical_term(en_s):
+                                    final_lines.append(en_s)
+                                    continue
+                                    
+                                if mode_overwrite == "append" and i < len(trans_lines) and trans_lines[i].strip() and re.search(l_regex, trans_lines[i]):
+                                    final_lines.append(trans_lines[i])
+                                else:
+                                    final_lines.append(en_s)
+                                    keys_to_translate[str(i)] = en_s
+
+                            total_en = len(keys_to_translate)
+                            if total_en > 0:
+                                self.log_colored(f"⚡ Перевод {mod_name} [Книга MD] - {len(keys_to_translate)} строк", "magenta")
+                                trans_dict = self.translate_engine(keys_to_translate, engine, lang_settings, context_name=mod_name)
+                                
+                                for i_str, t_val in trans_dict.items():
+                                    i_idx = int(i_str)
+                                    if i_str in md_prefixes:
+                                        p, s = md_prefixes[i_str]
+                                        final_lines[i_idx] = p + t_val + s
+                                    else:
+                                        final_lines[i_idx] = t_val
+                                        
+                                out_data = '\n'.join(final_lines).encode('utf-8')
+                                
+                                if output_mode == "resourcepack" and rp_zip_handle:
+                                    if trans_filename not in written_files:
+                                        rp_zip_handle.writestr(trans_filename, out_data)
+                                        written_files.add(trans_filename)
+                                        # Гарантируем перезапись оригинала для AE2
+                                        if trans_filename != item.filename and item.filename not in written_files:
+                                            try: 
+                                                rp_zip_handle.writestr(item.filename, out_data)
+                                                written_files.add(item.filename)
+                                            except: pass
+                                else:
+                                    if zout: zout.writestr(trans_filename, out_data)
+                                    ru_files_written.add(trans_filename)
+                                translated_any = True
+                            else:
+                                if mode_overwrite == "skip":
+                                    self.log_colored(f"⏩ {mod_name} [Книга MD]: Пропуск", "yellow")
+                                if output_mode == "resourcepack" and rp_zip_handle:
+                                    if trans_filename not in written_files:
+                                        rp_zip_handle.writestr(trans_filename, '\n'.join(final_lines).encode('utf-8'))
+                                        written_files.add(trans_filename)
+                                elif output_mode == "inplace":
+                                    if zout: zout.writestr(trans_filename, '\n'.join(final_lines).encode('utf-8'))
+                                    ru_files_written.add(trans_filename)
+
+                    if output_mode == "inplace" and zout:
                         for item in zin.infolist():
                             if (target_file in item.filename.lower() or f"/{lang_settings['file']}/" in item.filename.lower()) and item.filename not in ru_files_written:
                                 try: zout.writestr(item, zin.read(item))
@@ -892,7 +1365,7 @@ class TranslatorApp(ctk.CTk):
 
         except Exception as e:
             if os.path.exists(temp_filepath): os.remove(temp_filepath)
-            self.log_colored(f"❌ Критическая ошибка в {mod_name}: {e}", "red")
+            self.log_colored(f"❌ Ошибка в {mod_name}: {e}", "red")
 
     def process_snbt(self, filepath, engine, mode_overwrite, lang_settings):
         if not self.var_quests.get(): return
@@ -934,7 +1407,7 @@ class TranslatorApp(ctk.CTk):
             self.log_colored(f"⚡ Перевод {filename} [Квесты] - {len(strings_to_translate)} строк", "yellow")
             
             chunk_dict = {str(i): val for i, val in enumerate(strings_to_translate)}
-            trans_dict = self.translate_engine(chunk_dict, engine, lang_settings)
+            trans_dict = self.translate_engine(chunk_dict, engine, lang_settings, context_name=filename)
             trans_map = {strings_to_translate[i]: trans_dict.get(str(i), strings_to_translate[i]) for i in range(len(strings_to_translate))}
             
             def repl_single(m):
