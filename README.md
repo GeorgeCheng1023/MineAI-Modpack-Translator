@@ -13,8 +13,8 @@ You can translate your modpack from English into any of the following languages:
 ## 🖥️ User-Friendly Interface
 The program features a modern Graphical User Interface (GUI). You don't need to write console commands — simply select your modpack folder, check the desired boxes, choose your target language, and click "Start".
 
-![Main Window]([<img width="1431" height="1093" alt="Без имени" src="https://github.com/user-attachments/assets/23c4022a-39d6-4705-aa37-fb1be4ed7d76" />](https://github.com/Thedrezik/MineAI-Modpack-Translator/blob/main/interface.png?raw=true)
-) <!-- Assuming a similar repo or placeholder; adjust as needed -->
+![Main Window][<img width="1431" height="1093" alt="Без имени" src="https://github.com/user-attachments/assets/23c4022a-39d6-4705-aa37-fb1be4ed7d76" />](https://github.com/Thedrezik/MineAI-Modpack-Translator/blob/main/interface.png?raw=true)
+
 
 ---
 
@@ -252,5 +252,6 @@ pyinstaller --noconsole --onefile --icon=icon.ico translator.py
 ```
 
 (Готовый файл появится в папке dist).
+
 
 
