@@ -22,7 +22,7 @@ The program features a modern Graphical User Interface (GUI). You don't need to 
 
 You don't need to install Python or mess with code! You can download the ready-to-use application.
 
-1. Go to the [Releases]([https://github.com/Y-RyuZU/MinecraftModsLocalizer/releases](https://github.com/Thedrezik/MineAI-Modpack-Translator/releases) tab on the right. <!-- Using the closest matching repo; replace with actual if different -->
+1. Go to the [Releases](https://github.com/Thedrezik/MineAI-Modpack-Translator/releases) tab on the right. <!-- Using the closest matching repo; replace with actual if different -->
 2. Download the latest **`MineAI_Translator.exe`** file.
 3. Place it in a convenient folder and run it with a double click.
 
@@ -146,7 +146,7 @@ MineAI Translator — это мощный, умный и безопасный и
 
 Вам не обязательно устанавливать Python и возиться с кодом! Вы можете скачать уже готовую, собранную программу.
 
-1. Перейдите в раздел [Releases]([https://github.com/Y-RyuZU/MinecraftModsLocalizer/releases](https://github.com/Thedrezik/MineAI-Modpack-Translator/releases)) справа.
+1. Перейдите в раздел [Releases]((https://github.com/Thedrezik/MineAI-Modpack-Translator/releases)) справа.
 2. Скачайте последний файл MineAI_Translator.exe.
 3. Поместите его в удобную папку и запустите двойным кликом.
 
@@ -252,6 +252,7 @@ pyinstaller --noconsole --onefile --icon=icon.ico translator.py
 ```
 
 (Готовый файл появится в папке dist).
+
 
 
 
