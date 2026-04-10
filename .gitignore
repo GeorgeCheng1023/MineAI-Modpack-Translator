@@ -6,3 +6,4 @@ config/
 *.jar.temp
 *.snbt.bak
 __pycache__/
+cache.json

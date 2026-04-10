@@ -75,21 +75,64 @@ IGNORE_TERMS.sort(key=len, reverse=True)
 _escaped_terms = [re.escape(t) for t in IGNORE_TERMS]
 IGNORE_PATTERN = re.compile(r'(?<![a-zA-Z])(' + '|'.join(_escaped_terms) + r')(?![a-zA-Z])')
 
-# ================= ВНЕШНИЙ СЛОВАРЬ АВТОЗАМЕН =================
+# ================= TERMINOLOGY FIXES =================
 DEFAULT_DICT = {
-    "полуслой": "плита",
-    "полуслои": "плиты",
-    "полукирпич": "плита",
-    "полукирпичи": "плиты",
-    "сыромятная медь": "сырая медь",
-    "сыромятного меди": "сырой меди",
-    "сыромятное железо": "сырое железо",
-    "сыромятного железа": "сырого железа",
-    "сыромятное золото": "сырое золото",
-    "сыромятного золота": "сырого золота",
-    "необтanium": "необтаниум",
-    "доместик": "прирученный",
-    "wereld": "мир"
+    "single": "單一",
+    "double": "雙重",
+    "singleplayer": "單人模式",
+    "multiplayer": "多人模式",
+    "gui": "介面",
+    "ui": "介面",
+    "menu": "選單",
+    "tooltip": "提示",
+    "quest": "任務",
+    "block": "方塊",
+    "item": "物品",
+    "fluid": "流體",
+    "energy": "能量",
+    "inventory": "物品欄",
+    "crafting": "合成",
+    "upgrade": "升級",
+    "config": "設定",
+    "toggle": "切換",
+    "enabled": "啟用",
+    "disable": "停用",
+    "disabled": "停用",
+    "storage": "儲存",
+    "output": "輸出",
+    "input": "輸入",
+    "rarity": "稀有度",
+    "damage": "傷害",
+    "speed": "速度",
+    "range": "範圍",
+    "chance": "機率",
+    "hotbar": "快捷列",
+    "armor": "護甲",
+    "helmet": "頭盔",
+    "boots": "靴子",
+    "chestplate": "胸甲",
+    "leggings": "護腿",
+    "pickaxe": "鎬",
+    "sword": "劍",
+    "shovel": "鏟",
+    "axe": "斧",
+    "hoe": "鋤",
+    "block entity": "方塊實體",
+    "recipe": "配方",
+    "recipe book": "配方書",
+    "screen": "畫面",
+    "screen type": "畫面類型",
+    "unlock": "解鎖",
+    "locked": "鎖定",
+    "progress": "進度",
+    "polymorph": "變形",
+    "transmutation": "轉化",
+    "polymorphic": "多型",
+    "world": "世界",
+    "dimension": "維度",
+    "biome": "生態域",
+    "nether": "地獄",
+    "end": "終界"
 }
 
 def load_dictionary():
@@ -137,7 +180,7 @@ def fix_terminology(text):
             if word.istitle(): return right.capitalize()
             elif word.isupper(): return right.upper()
             return right
-        text = re.sub(r'\b' + wrong + r'\b', repl, text, flags=re.IGNORECASE)
+        text = re.sub(r'\b' + re.escape(wrong) + r'\b', repl, text, flags=re.IGNORECASE)
     return text
 
 def polish_translation(text):
@@ -215,8 +258,79 @@ def load_ui_i18n(filepath=UI_I18N_FILE):
 
 UI_LANGUAGE_LABELS, UI_TRANSLATIONS = load_ui_i18n()
 
+MINECRAFT_TRANSLATION_SYSTEM_PROMPT = (
+    "You are a professional Minecraft mod localization engine. "
+    "Translate modpack UI, quest, and guide text into the target language naturally and consistently. "
+    "Prefer established in-game terminology over literal dictionary meaning. "
+    "Do not translate JSON keys, registry IDs, file paths, tags, placeholders, markdown links, or formatting markers. "
+    "Preserve token placeholders such as [#0#] exactly. "
+    "If a term is ambiguous, choose the Minecraft/game meaning first. "
+    "Return only valid JSON and nothing else."
+)
+
+MINECRAFT_TRANSLATION_HINTS = (
+    "Terminology hints: single = single/single selection UI meaning, not relationship meaning; "
+    "double = double/two-part UI meaning; gui/ui = interface; tooltip = hover text; quest = quest/task; "
+    "block = Minecraft block; item = item; fluid = fluid/liquid; energy = power/energy; inventory = inventory/storage; "
+    "crafting = crafting; upgrade = upgrade module/item; config = configuration; toggle = switch on/off; "
+    "enabled/disabled = on/off state; recipe = recipe; recipe book = recipe book; screen = screen; "
+    "unlock = unlock; locked = locked; progress = progress; world = world; dimension = dimension; biome = biome; "
+    "nether = Nether; end = The End."
+)
+
+
+def build_minecraft_messages(lang_name, context_name, ai_mode, sub_dict):
+    if ai_mode == "context" and context_name:
+        user_prompt = (
+            f"Translate the following Minecraft mod or quest text into {lang_name}. "
+            f"Use the mod name '{context_name}' as context. "
+            "Keep the wording natural for Minecraft players and stay consistent with mod terminology. "
+            "Do not translate keys. Preserve [#0#] tags exactly. Return only valid JSON. "
+            f"Text: {json.dumps(sub_dict, ensure_ascii=False)}"
+        )
+    else:
+        user_prompt = (
+            f"Translate the following Minecraft modpack JSON string values from English to {lang_name}. "
+            "Keep the meaning natural for Minecraft UI, quest, and guide text. "
+            "Do not translate keys. Preserve [#0#] tags exactly. Return only valid JSON. "
+            f"Text: {json.dumps(sub_dict, ensure_ascii=False)}"
+        )
+
+    system_prompt = f"{MINECRAFT_TRANSLATION_SYSTEM_PROMPT}\n\n{MINECRAFT_TRANSLATION_HINTS}"
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
 def get_mod_name(filepath):
     return os.path.basename(filepath).replace('.jar', '').split('-0')[0].split('-1')[0].replace('_', ' ').title()
+
+
+def validate_gguf_split_files(model_path):
+    """Return (ok, message). For split GGUF models, ensure all parts exist."""
+    if not model_path or not os.path.exists(model_path):
+        return False, f"Model file not found: {model_path}"
+
+    model_name = os.path.basename(model_path)
+    match = re.search(r'-(\d{5})-of-(\d{5})\.gguf$', model_name, flags=re.IGNORECASE)
+    if not match:
+        return True, ""
+
+    total_parts = int(match.group(2))
+    prefix = model_name[:match.start()]
+    model_dir = os.path.dirname(model_path)
+
+    missing_parts = []
+    for i in range(1, total_parts + 1):
+        part_name = f"{prefix}-{i:05d}-of-{total_parts:05d}.gguf"
+        part_path = os.path.join(model_dir, part_name)
+        if not os.path.exists(part_path):
+            missing_parts.append(part_name)
+
+    if missing_parts:
+        return False, f"Missing GGUF split part(s): {', '.join(missing_parts)}"
+
+    return True, ""
 
 def is_translation_key(text):
     t = text.strip()
@@ -997,6 +1111,11 @@ class TranslatorApp(ctk.CTk):
                 return True
         except: pass
 
+        model_ok, model_error = validate_gguf_split_files(self.ai_model_path)
+        if not model_ok:
+            self.log_t("ai_start_error", "red", error=model_error)
+            return False
+
         self.log_t("ai_starting", "cyan", model=os.path.basename(self.ai_model_path))
         kobold_exe = os.path.join(AI_DIR, "koboldcpp.exe") if os.path.exists(os.path.join(AI_DIR, "koboldcpp.exe")) else "koboldcpp"
         
@@ -1213,15 +1332,11 @@ class TranslatorApp(ctk.CTk):
             def process_ai_chunk(chunk_keys):
                 if not self.is_running: return False
                 sub_dict = {k: to_translate[k]["masked"] for k in chunk_keys}
-                
-                if ai_mode == "context" and context_name:
-                    prompt = f"Ты локализатор. Переведи текст мода/квеста '{context_name}' на {lang_settings['name']}. Адаптируй лор мода. ПРАВИЛА: Не переводи ключи. Сохраняй [#0#]. Верни ТОЛЬКО валидный JSON. Текст: {json.dumps(sub_dict, ensure_ascii=False)}"
-                else:
-                    prompt = f"Translate the following JSON string values from English to {lang_settings['name']}. RULES: Do not translate keys. Preserve [#0#] tags exactly. Return ONLY valid JSON. Text: {json.dumps(sub_dict, ensure_ascii=False)}"
+                messages = build_minecraft_messages(lang_settings['name'], context_name, ai_mode, sub_dict)
                 
                 self.status_t("ai_translating_batch", None, count=len(chunk_keys), eta=self.update_eta())
                 try:
-                    res = requests.post(KOBOLD_API, json={"messages": [{"role": "user", "content": prompt}], "temperature": 0.1, "max_tokens": max_tok}, timeout=300)
+                    res = requests.post(KOBOLD_API, json={"messages": messages, "temperature": 0.0, "max_tokens": max_tok}, timeout=300)
                     res.raise_for_status()
                     data = res.json()
                     
